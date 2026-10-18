@@ -1,4 +1,5 @@
 import type { Spectrum } from '../audio/spectrum'
+import type { StereoMetrics } from '../audio/stereoMetrics'
 
 export type SourceFormat = 'wav' | 'mp3'
 
@@ -44,11 +45,27 @@ export interface DspStatus {
   spectra: { before: Spectrum; after: Spectrum } | null
   /** フォールバックのコンプ・メイクアップ打消し（dB）。未計測は null */
   makeupCancelDb: number | null
+  spatial: SpatialStatus
+}
+
+export interface SpatialStatus {
+  analysis: 'idle' | 'measuring' | 'ready' | 'silent' | 'error'
+  /** 原音とラウドネスをそろえるトリム（dB） */
+  trimDb: number
+  /** WIDE の Side ゲイン上限（原音の幅から決定） */
+  wideSideCapDb: number | null
+  before: StereoMetrics | null
+  after: StereoMetrics | null
+  monoColorationDb: number | null
+  stereoColorationDb: number | null
+  predictedLimiterGrDb: number | null
+  hrtfLatencyMs: number | null
 }
 
 export interface DspMeters {
   bassGrDb: number
   limiterGrDb: number
+  spatialLimiterGrDb: number
 }
 
 export type LoadErrorKind =

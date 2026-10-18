@@ -36,6 +36,8 @@ const FALLBACK_PATH: typeof SIGNAL_PATH = [
   ...SIGNAL_PATH.slice(-2),
 ]
 
+const SPATIAL_LABEL = { off: 'SPATIAL OFF', wide: 'SPATIAL: WIDE', cinema: 'SPATIAL: CINEMA', hall: 'SPATIAL: HALL' } as const
+
 function nodeClass(kind: NodeKind, bypass: boolean): string {
   if (kind === 'pending') return 'is-pending'
   if (kind === 'process' && bypass) return 'is-off'
@@ -43,8 +45,14 @@ function nodeClass(kind: NodeKind, bypass: boolean): string {
 }
 
 export function TransportPanel({ player }: TransportPanelProps) {
-  const { audio, status, position, duration, volume, bypass, dsp } = player
-  const path = dsp?.dynamicsEngine === 'fallback' ? FALLBACK_PATH : SIGNAL_PATH
+  const { audio, status, position, duration, volume, bypass, dsp, bassEnabled, spatialParams } = player
+  const bassPath = dsp?.dynamicsEngine === 'fallback' ? FALLBACK_PATH : SIGNAL_PATH
+  // VOLUME / OUTPUT の手前に空間処理を入れて表示する
+  const path = [
+    ...bassPath.slice(0, -2).map((n) => (n.kind === 'process' && !bassEnabled ? { ...n, kind: 'pending' as const, note: undefined } : n)),
+    { name: SPATIAL_LABEL[spatialParams.mode], kind: spatialParams.mode === 'off' ? ('pending' as const) : ('process' as const) },
+    ...bassPath.slice(-2),
+  ]
   // シークバーのドラッグ中は表示だけ更新し、離した時点でシークする（ソース再生成によるノイズ防止）
   const [scrub, setScrub] = useState<number | null>(null)
   const shown = scrub ?? position
@@ -65,7 +73,7 @@ export function TransportPanel({ player }: TransportPanelProps) {
       className="panel--transport"
       aside={
         <>
-          {bypass ? <Badge tone="idle">BYPASS：原音</Badge> : <Badge tone="pending">処理音・{player.bassParams.mode === 'extreme' ? 'EXTREME' : 'NORMAL'}</Badge>}
+          {bypass ? <Badge tone="idle">ORIGINAL：原音</Badge> : <Badge tone="pending">PROCESSED</Badge>}
           <Badge tone={status === 'playing' ? 'live' : 'idle'}>{STATUS_LABEL[status]}</Badge>
         </>
       }
@@ -97,6 +105,14 @@ export function TransportPanel({ player }: TransportPanelProps) {
       />
 
       <div className="transport-row">
+        <div className="ab-switch" role="radiogroup" aria-label="試聴する音（B キーで切替）">
+          <button type="button" role="radio" aria-checked={bypass} className={`ab-switch__item${bypass ? ' is-active is-original' : ''}`} onClick={() => player.setBypass(true)}>
+            ORIGINAL
+          </button>
+          <button type="button" role="radio" aria-checked={!bypass} className={`ab-switch__item${!bypass ? ' is-active' : ''}`} onClick={() => player.setBypass(false)}>
+            PROCESSED
+          </button>
+        </div>
         <div className="transport-buttons">
           <button
             type="button"
@@ -142,7 +158,7 @@ export function TransportPanel({ player }: TransportPanelProps) {
       </div>
 
       <div className="signal-path" aria-label="現在の信号経路">
-        <span className="signal-path__title">SIGNAL PATH{bypass && ' — BYPASS'}</span>
+        <span className="signal-path__title">SIGNAL PATH{bypass && ' — ORIGINAL（全段 BYPASS）'}</span>
         <ol>
           {path.map((node) => (
             <li key={node.name} className={nodeClass(node.kind, bypass)}>

@@ -22,7 +22,7 @@ export function AppHeader() {
         <span className="meta-chip meta-chip--secure" title="音源はこのブラウザ内でのみ処理され、外部へ送信されません">
           <LockIcon /> ローカル処理のみ・外部送信なし
         </span>
-        <span className="meta-chip">PHASE 02.5 / 開発版</span>
+        <span className="meta-chip">SPATIAL PROTOTYPE / 開発版</span>
       </div>
     </header>
   )

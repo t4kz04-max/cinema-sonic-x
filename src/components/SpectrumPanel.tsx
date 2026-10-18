@@ -123,7 +123,7 @@ export function SpectrumPanel({ dsp, bypass }: SpectrumPanelProps) {
     <Panel
       index="06"
       label="ANALYZER"
-      title="処理前後のスペクトル比較"
+      title="重低音エンジン: 処理前後のスペクトル比較"
       className="panel--spectrum"
       aside={
         status === 'measuring' ? (

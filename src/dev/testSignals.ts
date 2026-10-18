@@ -53,6 +53,11 @@ interface MixSpec {
   voice: number
   /** マスタリング段のドライブ（大きいほど音圧が高い） */
   drive: number
+  /**
+   * ノイズ（楽器群）の左右独立成分の比率。省略時は左右完全に独立（非常に広いステレオ）。
+   * 指定時は 共通成分 + width × 独立成分（一般的なミックスの部分的な相関）
+   */
+  noiseWidth?: number
   peak: number
 }
 
@@ -61,6 +66,14 @@ function makeProgram(spec: MixSpec, seed: number): Float32Array[] {
   const TAU = 2 * Math.PI
   let nl = pinkNoise(n, seed)
   let nr = pinkNoise(n, seed + 7)
+  if (spec.noiseWidth !== undefined) {
+    const shared = pinkNoise(n, seed + 99)
+    const norm = 1 / Math.sqrt(1 + spec.noiseWidth * spec.noiseWidth)
+    for (let i = 0; i < n; i++) {
+      nl[i] = (shared[i] + spec.noiseWidth * nl[i]) * norm
+      nr[i] = (shared[i] + spec.noiseWidth * nr[i]) * norm
+    }
+  }
   if (spec.noiseHighpass > 0) {
     nl = onePoleHighpass(onePoleHighpass(nl, spec.noiseHighpass), spec.noiseHighpass)
     nr = onePoleHighpass(onePoleHighpass(nr, spec.noiseHighpass), spec.noiseHighpass)
@@ -116,6 +129,13 @@ export function programEdm(seconds = 12): AudioBuffer {
 /** 一般的なポップス相当: ピンクノイズに近いバランス・高音圧（ピーク -1 dBFS） */
 export function programPop(seconds = 12): AudioBuffer {
   return toBuffer(makeProgram({ seconds, kick: 0.22, bass: 0.09, noise: 0.55, noiseHighpass: 60, voice: 0.09, drive: 2.0, peak: DBFS_M1 }, 17))
+}
+
+/** 一般的なステレオミックス相当: 楽器群の左右相関が部分的（中高域の S/M 比 約 -9 dB） */
+export function programStereoMix(seconds = 10): AudioBuffer {
+  return toBuffer(
+    makeProgram({ seconds, kick: 0.22, bass: 0.09, noise: 0.55, noiseHighpass: 60, noiseWidth: 0.45, voice: 0.09, drive: 2.0, peak: DBFS_M1 }, 41),
+  )
 }
 
 /** アコースティック相当: 低音が少なく、声・中高域主体（ピーク -1 dBFS） */

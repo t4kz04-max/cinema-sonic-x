@@ -1,5 +1,6 @@
 // DSP 自己診断（tests/dsp-selftest.html）をヘッドレスの Chrome / Edge で実行する。
-// 使い方: npm run test:dsp            （Chrome → Edge の順に自動検出）
+// 使い方: npm run test:dsp            （重低音エンジン。Chrome → Edge の順に自動検出）
+//         npm run test:spatial        （空間音響プロトタイプ）
 //         CSX_BROWSER=<実行ファイル> npm run test:dsp
 // 依存追加なし: Vite の開発サーバー + Chrome DevTools Protocol（Node 22+ の組み込み WebSocket）
 
@@ -27,7 +28,8 @@ if (!browser) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const server = await createServer({ logLevel: 'error', server: { port: 5199, strictPort: false } })
 await server.listen()
-const pageUrl = new URL('tests/dsp-selftest.html', server.resolvedUrls.local[0]).href
+const suite = process.argv.includes('--spatial') ? '?suite=spatial' : ''
+const pageUrl = new URL(`tests/dsp-selftest.html${suite}`, server.resolvedUrls.local[0]).href
 
 const port = 9300 + Math.floor(Math.random() * 500)
 const profile = mkdtempSync(join(tmpdir(), 'csx-selftest-'))

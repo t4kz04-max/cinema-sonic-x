@@ -1,8 +1,10 @@
 import { runDspSelfTest } from './dspSelfTest'
+import { runSpatialSelfTest } from './spatialSelfTest'
 
 const out = document.getElementById('out')!
 out.textContent = '実行中…'
-runDspSelfTest()
+const suite = new URLSearchParams(location.search).get('suite') === 'spatial' ? runSpatialSelfTest : runDspSelfTest
+suite()
   .then((results) => {
     const failed = results.filter((r) => !r.pass).length
     let group = ''

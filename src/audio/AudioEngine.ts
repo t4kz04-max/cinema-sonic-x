@@ -3,6 +3,10 @@ import { analyzeSource, bassThresholdFor, buildAnalysisExcerpt, planProcessing, 
 import { DEFAULT_BASS_PARAMS, type BassParams } from './bassSpec'
 import { eqCapScale } from './biquadMath'
 import { linearToDb } from './loudness'
+import { analyzeSpatialSource, buildSpatialExcerpt, planSpatial, wideCapFor } from './spatial/spatialAnalysis'
+import { createSpatialGraph, measureHrtfLatency, type SpatialGraph } from './spatial/spatialGraph'
+import { DEFAULT_SPATIAL_PARAMS, type SpatialParams } from './spatial/spatialSpec'
+import type { StereoMetrics } from './stereoMetrics'
 import {
   createProcessingGraph,
   dynamicsSettingsFor,
@@ -36,12 +40,29 @@ const INITIAL_DSP_STATUS: DspStatus = {
   predictedLimiterGrDb: null,
   spectra: null,
   makeupCancelDb: null,
+  spatial: {
+    analysis: 'idle',
+    trimDb: 0,
+    wideSideCapDb: null,
+    before: null,
+    after: null,
+    monoColorationDb: null,
+    stereoColorationDb: null,
+    predictedLimiterGrDb: null,
+    hrtfLatencyMs: null,
+  },
 }
+
+/** ベクトルスコープ用 AnalyserNode のサイズ */
+const SCOPE_FFT_SIZE = 2048
 
 /**
  * 再生グラフ:
- *   AudioBufferSourceNode → ProcessingGraph（BYPASS / 低音EQ / 低域コンプ / トリム / リミッター）
- *     → GainNode(モニター音量) → destination
+ *   AudioBufferSourceNode → ProcessingGraph（重低音: EQ / 低域コンプ / トリム / リミッター）
+ *     → SpatialGraph（WIDE / CINEMA / HALL / トリム / リミッター）→ GainNode(モニター音量) → destination
+ *
+ * ORIGINAL/PROCESSED（setBypass）は両方の段を同時に BYPASS する。各段の BYPASS 経路はゲイン 1 のみで、
+ * 2 段直列でも原音とビット一致する。重低音エンジンは setBassEnabled で個別に ON/OFF できる。
  *
  * モニター音量は常に最終段で、Phase 04 の書き出し音声には含めない。
  * AudioBufferSourceNode は一度しか start できないため、再生・シークのたびに作り直す。
@@ -51,6 +72,9 @@ export class AudioEngine {
   private ready: Promise<AudioContext> | null = null
   private monitorGain: GainNode | null = null
   private graph: ProcessingGraph | null = null
+  private spatialGraph: SpatialGraph | null = null
+  private scope: { left: AnalyserNode; right: AnalyserNode } | null = null
+  private hrtfLatency = 0
   private useWorklet = false
   private makeupCancel = 1
   private buffer: AudioBuffer | null = null
@@ -65,9 +89,16 @@ export class AudioEngine {
 
   private params: BassParams = { ...DEFAULT_BASS_PARAMS }
   private bypass = false
+  /** 空間音響の評価を優先するため、重低音エンジンは既定で OFF */
+  private bassEnabled = false
+  private spatialParams: SpatialParams = { ...DEFAULT_SPATIAL_PARAMS }
+  private spatialExcerpt: AudioBuffer | null = null
+  private spatialBefore: StereoMetrics | null = null
+  private spatialPlanning = false
+  private spatialDirty = false
   private dsp: DspStatus = { ...INITIAL_DSP_STATUS }
   private dspListener: ((status: DspStatus) => void) | null = null
-  private meters: DspMeters = { bassGrDb: 0, limiterGrDb: 0 }
+  private meters: DspMeters = { bassGrDb: 0, limiterGrDb: 0, spatialLimiterGrDb: 0 }
   private excerpt: AudioBuffer | null = null
   private sourceAnalysis: SourceAnalysis | null = null
   /** 直近の計画で決まった安全倍率（新しい計画が出るまで維持する） */
@@ -118,7 +149,7 @@ export class AudioEngine {
     const graph = createProcessingGraph(ctx, {
       params: this.params,
       scale,
-      bypass: this.bypass,
+      bypass: this.bassBypassed(),
       dynamics: dynamicsSettingsFor(this.params.mode, bassThresholdFor(this.params, this.sourceAnalysis), this.dsp.trimDb, {
         reportIntervalMs: METER_INTERVAL_MS,
       }),
@@ -126,12 +157,42 @@ export class AudioEngine {
     })
     graph.setMakeupCancel(this.makeupCancel, false)
     graph.onMeter((m) => {
-      this.meters = { bassGrDb: m.bassGrDb, limiterGrDb: m.limiterGrDb }
+      this.meters = { ...this.meters, bassGrDb: m.bassGrDb, limiterGrDb: m.limiterGrDb }
     })
-    graph.output.connect(gain)
+
+    this.hrtfLatency = await measureHrtfLatency(ctx.sampleRate)
+    const spatial = createSpatialGraph(ctx, {
+      params: this.spatialParams,
+      bypass: this.spatialBypassed(),
+      trimDb: this.dsp.spatial.trimDb,
+      useWorklet: this.useWorklet,
+      hrtfLatencySeconds: this.hrtfLatency,
+      wideSideCapDb: wideCapFor(this.spatialBefore),
+      reportIntervalMs: METER_INTERVAL_MS,
+    })
+    spatial.onMeter((m) => {
+      this.meters = { ...this.meters, spatialLimiterGrDb: m.limiterGrDb }
+    })
+    graph.output.connect(spatial.input)
+    spatial.output.connect(gain)
+
+    // ベクトルスコープ（モニター音量の前で取り出す）
+    const split = new ChannelSplitterNode(ctx, { numberOfOutputs: 2 })
+    const scopeIn = new GainNode(ctx, { channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'speakers' })
+    const left = new AnalyserNode(ctx, { fftSize: SCOPE_FFT_SIZE })
+    const right = new AnalyserNode(ctx, { fftSize: SCOPE_FFT_SIZE })
+    spatial.output.connect(scopeIn).connect(split)
+    split.connect(left, 0)
+    split.connect(right, 1)
+
     this.monitorGain = gain
     this.graph = graph
-    this.updateDsp({ dynamicsEngine: graph.engine })
+    this.spatialGraph = spatial
+    this.scope = { left, right }
+    this.updateDsp({
+      dynamicsEngine: graph.engine,
+      spatial: { ...this.dsp.spatial, hrtfLatencyMs: this.hrtfLatency * 1000 },
+    })
     return ctx
   }
 
@@ -213,9 +274,44 @@ export class AudioEngine {
     this.requestPlan()
   }
 
+  /** ORIGINAL（true）/ PROCESSED（false）。重低音・空間の両段を同時に切り替える */
   setBypass(bypass: boolean): void {
     this.bypass = bypass
-    this.graph?.setBypass(bypass, true)
+    this.applyBypass()
+  }
+
+  setBassEnabled(enabled: boolean): void {
+    this.bassEnabled = enabled
+    this.applyBypass()
+  }
+
+  setSpatialParams(params: SpatialParams): void {
+    const modeChanged = params.mode !== this.spatialParams.mode
+    this.spatialParams = { ...params }
+    this.spatialGraph?.setParams(this.spatialParams, true)
+    if (modeChanged) this.applyBypass()
+    this.requestSpatialPlan()
+  }
+
+  /** ベクトルスコープ用の直近の L/R 波形（長さ SCOPE_FFT_SIZE）。未初期化なら false */
+  readScope(left: Float32Array<ArrayBuffer>, right: Float32Array<ArrayBuffer>): boolean {
+    if (!this.scope) return false
+    this.scope.left.getFloatTimeDomainData(left)
+    this.scope.right.getFloatTimeDomainData(right)
+    return true
+  }
+
+  private bassBypassed(): boolean {
+    return this.bypass || !this.bassEnabled
+  }
+
+  private spatialBypassed(): boolean {
+    return this.bypass || this.spatialParams.mode === 'off'
+  }
+
+  private applyBypass(): void {
+    this.graph?.setBypass(this.bassBypassed(), true)
+    this.spatialGraph?.setBypass(this.spatialBypassed(), true)
   }
 
   /** ワークレットが報告する直近のゲインリダクション（dB, 正の値） */
@@ -229,6 +325,9 @@ export class AudioEngine {
     this.statusListener = null
     this.dspListener = null
     this.graph?.onMeter(null)
+    this.spatialGraph?.onMeter(null)
+    this.spatialGraph = null
+    this.scope = null
     void this.ctx?.close()
     this.ctx = null
     this.ready = null
@@ -242,6 +341,9 @@ export class AudioEngine {
     const token = ++this.analysisToken
     this.excerpt = null
     this.sourceAnalysis = null
+    this.spatialExcerpt = null
+    this.spatialBefore = null
+    void this.startSpatialAnalysis(buffer, token)
     this.updateDsp({ analysis: 'measuring', spectra: null, loudnessDeltaLu: null, outputPeakDb: null, predictedLimiterGrDb: null })
     try {
       await this.ensureReady()
@@ -306,6 +408,72 @@ export class AudioEngine {
     } finally {
       this.planning = false
     }
+  }
+
+  private async startSpatialAnalysis(buffer: AudioBuffer, token: number): Promise<void> {
+    this.updateSpatial({ analysis: 'measuring', before: null, after: null, monoColorationDb: null, stereoColorationDb: null })
+    try {
+      await this.ensureReady()
+      const excerpt = buildSpatialExcerpt(buffer)
+      const before = await analyzeSpatialSource(excerpt)
+      if (token !== this.analysisToken) return
+      this.spatialExcerpt = excerpt
+      this.spatialBefore = before
+      const cap = wideCapFor(before)
+      this.spatialGraph?.setWideSideCap(cap)
+      this.updateSpatial({ before, wideSideCapDb: cap })
+      this.requestSpatialPlan()
+    } catch {
+      if (token === this.analysisToken) this.updateSpatial({ analysis: 'error' })
+    }
+  }
+
+  private requestSpatialPlan(): void {
+    this.spatialDirty = true
+    if (!this.spatialPlanning) void this.runSpatialPlan()
+  }
+
+  private async runSpatialPlan(): Promise<void> {
+    this.spatialPlanning = true
+    try {
+      while (this.spatialDirty) {
+        this.spatialDirty = false
+        const token = this.analysisToken
+        const excerpt = this.spatialExcerpt
+        const before = this.spatialBefore
+        if (!excerpt || !before) return
+        const params = { ...this.spatialParams }
+        if (params.mode === 'off') {
+          this.updateSpatial({ analysis: 'ready', after: null, monoColorationDb: null, stereoColorationDb: null, predictedLimiterGrDb: null })
+          continue
+        }
+        this.updateSpatial({ analysis: 'measuring' })
+        let plan
+        try {
+          plan = await planSpatial(excerpt, before, params, { useWorklet: this.useWorklet, hrtfLatencySeconds: this.hrtfLatency })
+        } catch {
+          if (token === this.analysisToken) this.updateSpatial({ analysis: 'error' })
+          continue
+        }
+        if (token !== this.analysisToken || this.spatialDirty) continue
+        this.spatialGraph?.setTrimDb(plan.trimDb)
+        this.updateSpatial({
+          analysis: plan.after ? 'ready' : 'silent',
+          trimDb: plan.trimDb,
+          wideSideCapDb: plan.wideSideCapDb,
+          after: plan.after,
+          monoColorationDb: plan.monoColorationDb,
+          stereoColorationDb: plan.stereoColorationDb,
+          predictedLimiterGrDb: plan.predictedLimiterGrDb,
+        })
+      }
+    } finally {
+      this.spatialPlanning = false
+    }
+  }
+
+  private updateSpatial(patch: Partial<DspStatus['spatial']>): void {
+    this.updateDsp({ spatial: { ...this.dsp.spatial, ...patch } })
   }
 
   private updateDsp(patch: Partial<DspStatus>): void {

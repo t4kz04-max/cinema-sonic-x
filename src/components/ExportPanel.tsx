@@ -3,7 +3,7 @@ import { Badge, Panel } from './Panel'
 export function ExportPanel() {
   return (
     <Panel
-      index="05"
+      index="07"
       label="EXPORT"
       title="書き出し"
       className="panel--export"

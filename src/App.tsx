@@ -4,6 +4,7 @@ import { AppHeader } from './components/AppHeader'
 import { EnhancementPanel } from './components/EnhancementPanel'
 import { ExportPanel } from './components/ExportPanel'
 import { SourceInfoPanel } from './components/SourceInfoPanel'
+import { SpatialPanel } from './components/SpatialPanel'
 import { SpectrumPanel } from './components/SpectrumPanel'
 import { TransportPanel } from './components/TransportPanel'
 import { UploadZone } from './components/UploadZone'
@@ -13,11 +14,12 @@ function App() {
   const player = useAudioPlayer()
   const { audio, togglePlay, bypass, setBypass } = player
 
-  // Space: 再生/一時停止、B: BYPASS 切替。フォーカス中のボタンやスライダーの標準操作とは重複させない
+  // Space: 再生/一時停止、B: ORIGINAL / PROCESSED 切替。フォーカス中のボタンやスライダーの標準操作とは重複させない
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return
-      const target = e.target as HTMLElement | null
+      // window や document が target の場合もあるため Element に限定する
+      const target = e.target instanceof Element ? e.target : null
       if (e.code === 'KeyB') {
         if (target?.closest('textarea, input[type="text"]')) return
         e.preventDefault()
@@ -61,13 +63,14 @@ function App() {
         </div>
         <div className="console__col console__col--main">
           <TransportPanel player={player} />
+          <SpatialPanel player={player} />
           <EnhancementPanel player={player} />
-          <SpectrumPanel dsp={player.dsp} bypass={bypass} />
+          <SpectrumPanel dsp={player.dsp} bypass={bypass || !player.bassEnabled} />
         </div>
       </main>
       <footer className="app-footer">
         <span>音源はお使いのブラウザ内でのみ処理されます。サーバーや外部サービスへは送信されません。</span>
-        <span className="mono">CINEMA SONIC X · Phase 02.5</span>
+        <span className="mono">CINEMA SONIC X · Spatial Prototype</span>
       </footer>
     </div>
   )

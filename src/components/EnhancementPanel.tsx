@@ -67,7 +67,9 @@ const COMPENSATIONS: { id: CompensationMode; label: string }[] = [
 ]
 
 export function EnhancementPanel({ player }: EnhancementPanelProps) {
-  const { bassParams, bypass, dsp, meters } = player
+  const { bassParams, dsp, meters, bassEnabled } = player
+  // 重低音エンジンが OFF、または全体が ORIGINAL のときは処理されない
+  const bypass = player.bypass || !bassEnabled
   const spec = MODE_SPECS[bassParams.mode]
   const scale = (dsp?.capScale ?? 1) * (dsp?.safetyScale ?? 1)
   const gains = paramsToGains(bassParams, scale)
@@ -75,23 +77,23 @@ export function EnhancementPanel({ player }: EnhancementPanelProps) {
 
   return (
     <Panel
-      index="04"
+      index="05"
       label="ENHANCE"
       title="重低音エンジン"
       className={`panel--enhance${extreme ? ' is-extreme' : ''}`}
-      aside={bypass ? <Badge tone="idle">BYPASS（原音）</Badge> : <Badge tone="live">処理ON・{spec.label}</Badge>}
+      aside={!bassEnabled ? <Badge tone="idle">ENGINE OFF</Badge> : bypass ? <Badge tone="idle">ORIGINAL 試聴中</Badge> : <Badge tone="live">処理ON・{spec.label}</Badge>}
     >
       <div className="enhance-top">
         <button
           type="button"
-          className={`bypass-btn${bypass ? ' is-on' : ''}`}
-          aria-pressed={bypass}
-          onClick={() => player.setBypass(!bypass)}
-          title="処理前（原音）と処理後を切り替え（B キー）"
+          className={`bypass-btn engine-btn${bassEnabled ? ' is-enabled' : ''}`}
+          aria-pressed={bassEnabled}
+          onClick={() => player.setBassEnabled(!bassEnabled)}
+          title="重低音エンジンの ON/OFF（空間音響とは独立）"
         >
           <span className="bypass-btn__led" aria-hidden="true" />
-          <span className="bypass-btn__label">BYPASS</span>
-          <span className="bypass-btn__state">{bypass ? '原音を出力中' : '処理音を出力中'}</span>
+          <span className="bypass-btn__label">ENGINE</span>
+          <span className="bypass-btn__state">{bassEnabled ? 'ON（処理に含める）' : 'OFF（通過のみ）'}</span>
         </button>
 
         <div className="mode-switch" role="radiogroup" aria-label="処理モード">

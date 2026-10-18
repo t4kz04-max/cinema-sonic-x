@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test:dsp": "node scripts/run-dsp-selftest.mjs"
+    "test:dsp": "node scripts/run-dsp-selftest.mjs",
+    "test:spatial": "node scripts/run-dsp-selftest.mjs --spatial"
   },
   "dependencies": {
     "react": "^19.2.8",

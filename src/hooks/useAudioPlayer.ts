@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AudioEngine } from '../audio/AudioEngine'
 import { loadAudioFile } from '../audio/loadAudioFile'
 import { DEFAULT_BASS_PARAMS, type BassParams } from '../audio/bassSpec'
+import { DEFAULT_SPATIAL_PARAMS, type SpatialParams } from '../audio/spatial/spatialSpec'
 import type { DspMeters, DspStatus, LoadError, LoadedAudio, PlaybackStatus } from '../types/audio'
 
 /** 初期音量（%）。gain = (40/100)^2 = 0.16 ≒ -15.9 dB と控えめにする */
@@ -13,13 +14,14 @@ export function volumePercentToGain(percent: number): number {
   return v * v
 }
 
-const NO_METERS: DspMeters = { bassGrDb: 0, limiterGrDb: 0 }
+const NO_METERS: DspMeters = { bassGrDb: 0, limiterGrDb: 0, spatialLimiterGrDb: 0 }
 
 export function useAudioPlayer() {
   const engineRef = useRef<AudioEngine | null>(null)
   const volumeRef = useRef(DEFAULT_VOLUME_PERCENT)
   const loadTokenRef = useRef(0)
   const bassParamsRef = useRef<BassParams>(DEFAULT_BASS_PARAMS)
+  const spatialParamsRef = useRef<SpatialParams>(DEFAULT_SPATIAL_PARAMS)
 
   const [audio, setAudio] = useState<LoadedAudio | null>(null)
   const [status, setStatus] = useState<PlaybackStatus>('stopped')
@@ -29,6 +31,8 @@ export function useAudioPlayer() {
   const [error, setError] = useState<LoadError | null>(null)
   const [bassParams, setBassParamsState] = useState<BassParams>(DEFAULT_BASS_PARAMS)
   const [bypass, setBypassState] = useState(false)
+  const [bassEnabled, setBassEnabledState] = useState(false)
+  const [spatialParams, setSpatialParamsState] = useState<SpatialParams>(DEFAULT_SPATIAL_PARAMS)
   const [dsp, setDsp] = useState<DspStatus | null>(null)
   const [meters, setMeters] = useState<DspMeters>(NO_METERS)
 
@@ -145,6 +149,29 @@ export function useAudioPlayer() {
     [getEngine],
   )
 
+  const setSpatialParams = useCallback(
+    (patch: Partial<SpatialParams>) => {
+      const next = { ...spatialParamsRef.current, ...patch }
+      spatialParamsRef.current = next
+      setSpatialParamsState(next)
+      getEngine().setSpatialParams(next)
+    },
+    [getEngine],
+  )
+
+  const setBassEnabled = useCallback(
+    (value: boolean) => {
+      setBassEnabledState(value)
+      getEngine().setBassEnabled(value)
+    },
+    [getEngine],
+  )
+
+  const readScope = useCallback(
+    (left: Float32Array<ArrayBuffer>, right: Float32Array<ArrayBuffer>) => engineRef.current?.readScope(left, right) ?? false,
+    [],
+  )
+
   const setBypass = useCallback(
     (value: boolean) => {
       setBypassState(value)
@@ -174,6 +201,11 @@ export function useAudioPlayer() {
     setBassParams,
     bypass,
     setBypass,
+    bassEnabled,
+    setBassEnabled,
+    spatialParams,
+    setSpatialParams,
+    readScope,
     dsp,
     meters,
   }
