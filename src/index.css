@@ -1,0 +1,78 @@
+:root {
+  /* 背景: 黒〜ダークネイビー */
+  --bg-0: #05060b;
+  --bg-1: #090c17;
+  --panel: #0d1222;
+  --panel-2: #111830;
+  --inset: #070a14;
+  --line: #1c2440;
+  --line-strong: #2a3459;
+
+  /* テキスト */
+  --text: #c9cee3;
+  --text-strong: #f2f3fa;
+  --text-dim: #7d86a8;
+  --text-faint: #4f5878;
+
+  /* アクセント: バイオレット */
+  --accent: #8b5cf6;
+  --accent-hi: #a78bfa;
+  --accent-soft: #c4b5fd;
+  --accent-glow: rgba(139, 92, 246, 0.45);
+  --accent-bg: rgba(139, 92, 246, 0.12);
+
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --danger: #f87171;
+
+  --radius: 14px;
+  --radius-sm: 8px;
+
+  --sans: 'Segoe UI', 'Yu Gothic UI', 'Hiragino Sans', Meiryo, system-ui, sans-serif;
+  --mono: 'Cascadia Mono', Consolas, ui-monospace, 'SFMono-Regular', monospace;
+
+  color-scheme: dark;
+  font: 14px/1.6 var(--sans);
+  color: var(--text);
+  background: var(--bg-0);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(1200px 600px at 75% -10%, rgba(91, 61, 196, 0.16), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(40, 62, 140, 0.18), transparent 60%),
+    linear-gradient(180deg, var(--bg-1), var(--bg-0));
+  background-attachment: fixed;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent-hi);
+  outline-offset: 2px;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
