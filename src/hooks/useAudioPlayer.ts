@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AudioEngine } from '../audio/AudioEngine'
 import { loadAudioFile } from '../audio/loadAudioFile'
 import type { LoopRegion, LoopType } from '../audio/loopRegion'
 import { DEFAULT_BASS_PARAMS, type BassParams } from '../audio/bassSpec'
 import { DEFAULT_SPATIAL_PARAMS, type SpatialParams } from '../audio/spatial/spatialSpec'
+import { cloneDsp, dspEquals, type DspConfig } from '../audio/dspConfig'
+import { getPreset, matchPreset, presetToDsp, type PresetId } from '../audio/presets/spatialPresets'
+import { deleteCustom, loadCustom, saveCustom, type SavedCustom } from '../utils/customPresetStorage'
 import type { DspMeters, DspStatus, LoadError, LoadedAudio, PlaybackStatus } from '../types/audio'
 
 /** 初期音量（%）。gain = (40/100)^2 = 0.16 ≒ -15.9 dB と控えめにする */
@@ -21,6 +24,25 @@ export interface LoopState {
 }
 
 const INITIAL_LOOP: LoopState = { enabled: false, type: 'normal' }
+
+/**
+ * プリセットパネルの UI 状態（DSP 設定とは別に持つ）。
+ * 最後にカードから適用した設定の出どころ。詳細設定を変えると DSP 設定がこれと一致しなくなり CUSTOM になる
+ */
+export type PresetSource = { kind: 'preset'; id: PresetId } | { kind: 'saved' } | null
+
+export interface PresetState {
+  source: PresetSource
+  /** 現在の DSP 設定と完全に一致するプリセット */
+  activeId: PresetId | null
+  /** カードから適用した後に詳細設定を変えた状態 */
+  custom: boolean
+  /** 保存した CUSTOM と現在の設定が一致する */
+  savedActive: boolean
+  saved: SavedCustom | null
+  /** 保存・読み込みの失敗メッセージ（再生には影響しない） */
+  storageMessage: string | null
+}
 
 const NO_METERS: DspMeters = { bassGrDb: 0, limiterGrDb: 0, spatialLimiterGrDb: 0 }
 
@@ -46,6 +68,10 @@ export function useAudioPlayer() {
   const [meters, setMeters] = useState<DspMeters>(NO_METERS)
   const [loop, setLoopState] = useState<LoopState>(INITIAL_LOOP)
   const [musicRegion, setMusicRegion] = useState<LoopRegion | null>(null)
+  const [presetSource, setPresetSource] = useState<PresetSource>(null)
+  const [initialSaved] = useState(loadCustom)
+  const [saved, setSaved] = useState<SavedCustom | null>(initialSaved.ok ? initialSaved.value : null)
+  const [storageMessage, setStorageMessage] = useState<string | null>(initialSaved.ok ? null : initialSaved.message)
 
   const getEngine = useCallback((): AudioEngine => {
     if (!engineRef.current) {
@@ -190,6 +216,61 @@ export function useAudioPlayer() {
     [getEngine],
   )
 
+  /** DSP 設定一式を適用する（プリセット・保存した CUSTOM）。元データはコピーして渡す */
+  const applyDspConfig = useCallback(
+    (config: DspConfig) => {
+      const c = cloneDsp(config)
+      spatialParamsRef.current = c.spatial
+      bassParamsRef.current = c.bass
+      setSpatialParamsState(c.spatial)
+      setBassParamsState(c.bass)
+      setBassEnabledState(c.bassEnabled)
+      getEngine().applyDsp(c)
+    },
+    [getEngine],
+  )
+
+  const applyPreset = useCallback(
+    (id: PresetId) => {
+      applyDspConfig(presetToDsp(getPreset(id)))
+      setPresetSource({ kind: 'preset', id })
+    },
+    [applyDspConfig],
+  )
+
+  const dspConfig = useMemo<DspConfig>(() => ({ spatial: spatialParams, bass: bassParams, bassEnabled }), [spatialParams, bassParams, bassEnabled])
+
+  const applySavedCustom = useCallback(() => {
+    if (!saved) return
+    applyDspConfig(saved.dsp)
+    setPresetSource({ kind: 'saved' })
+  }, [applyDspConfig, saved])
+
+  const saveCurrentCustom = useCallback(() => {
+    const base = presetSource?.kind === 'preset' ? presetSource.id : presetSource?.kind === 'saved' ? (saved?.base?.id ?? null) : null
+    const r = saveCustom(cloneDsp(dspConfig), base)
+    if (r.ok) {
+      setSaved(r.value)
+      setStorageMessage(null)
+      setPresetSource({ kind: 'saved' })
+    } else setStorageMessage(r.message)
+  }, [dspConfig, presetSource, saved])
+
+  const deleteSavedCustom = useCallback(() => {
+    const r = deleteCustom()
+    if (r.ok) {
+      setSaved(null)
+      setStorageMessage(null)
+      setPresetSource((s) => (s?.kind === 'saved' ? null : s))
+    } else setStorageMessage(r.message)
+  }, [])
+
+  const presetState = useMemo<PresetState>(() => {
+    const activeId = matchPreset(dspConfig)
+    const savedActive = !!saved && dspEquals(saved.dsp, dspConfig)
+    return { source: presetSource, activeId, custom: presetSource !== null && activeId === null && !savedActive, savedActive, saved, storageMessage }
+  }, [dspConfig, presetSource, saved, storageMessage])
+
   const readMotion = useCallback(() => engineRef.current?.getMotionReport() ?? null, [])
   const readTail = useCallback(() => engineRef.current?.getTailReport() ?? null, [])
 
@@ -240,6 +321,12 @@ export function useAudioPlayer() {
     readTail,
     dsp,
     meters,
+    dspConfig,
+    presetState,
+    applyPreset,
+    applySavedCustom,
+    saveCurrentCustom,
+    deleteSavedCustom,
   }
 }
 

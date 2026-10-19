@@ -2,6 +2,7 @@
 // 使い方: npm run test:dsp            （重低音エンジン。Chrome → Edge の順に自動検出）
 //         npm run test:spatial        （空間音響プロトタイプ ＋ Motion。スイートごとにブラウザを起動し直す）
 //         npm run test:tail           （Phase 04: Spatial Tail / Loop / STOP・PAUSE・CUT。4 つに分けて実行）
+//         npm run test:preset         （Phase 05: プリセット / A/B 比較 / CUSTOM / 解析の最適化。13 に分けて実行）
 //         node scripts/run-dsp-selftest.mjs --suite=cpu   （個別スイート。--log で途中経過を表示）
 //         node scripts/run-dsp-selftest.mjs --suite=tail --query=groups=26-32   （一部のグループだけ）
 //         CSX_BROWSER=<実行ファイル> npm run test:dsp
@@ -37,14 +38,30 @@ const showLog = process.argv.includes('--log')
 const named = process.argv.find((a) => a.startsWith('--suite='))?.slice(8)
 // --query=<k=v>: ページに渡す追加のパラメーター
 const extra = process.argv.find((a) => a.startsWith('--query='))?.slice(8)
-// --tail: Phase 04 一式（グループを 4 つに分けて別々のブラウザで）
+// --tail: Phase 04 一式（グループを 4 つに分けて別々のブラウザで） / --preset: Phase 05 一式
 const suites = named
   ? [named]
   : process.argv.includes('--spatial')
     ? ['spatialcore', 'motion']
     : process.argv.includes('--tail')
       ? ['tail&groups=20-28', 'tail&groups=29-32', 'tail&groups=33-35', 'tail&groups=36-39']
-      : ['']
+      : process.argv.includes('--preset')
+        ? [
+            'preset&groups=40-41',
+            'preset&groups=42-42',
+            'preset&groups=43-43',
+            'preset&groups=44-45',
+            'preset&groups=46-46',
+            'preset&groups=47-47',
+            'preset&groups=48-48',
+            'preset&groups=49-49&program=pop',
+            'preset&groups=49-49&program=mix',
+            'preset&groups=49-49&program=acoustic',
+            'preset&groups=50-50',
+            'preset&groups=51-51',
+            'presetcpu',
+          ]
+        : ['']
 const MIN_FREE_MB = Number(process.env.CSX_MIN_FREE_MB ?? 400)
 
 const server = await createServer({ logLevel: 'error', server: { port: 5199, strictPort: false } })

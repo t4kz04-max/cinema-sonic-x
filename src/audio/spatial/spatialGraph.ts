@@ -1,10 +1,11 @@
+import { createAlignDelay } from '../alignDelay'
 import type { DynamicsMeter } from '../dynamicsTypes'
 import motionWorkletUrl from '../worklets/motion.worklet.ts?worker&url'
-import { SPEAKER_AZIMUTHS, SPEAKER_COUNT, type Envelope } from './motion'
+import { distanceDelaySeconds, SPEAKER_AZIMUTHS, SPEAKER_COUNT, type Envelope } from './motion'
 import { MOTION_FFT_SIZE, type MotionMessage, type MotionReport, type MotionTransport, type MotionWorkletOptions } from './motionTypes'
 import { dynamicsSettingsFor } from '../processingGraph'
 import { synthesizeHallIR } from './hallImpulse'
-import { BUTTERWORTH_Q_DB, dbToGain, fadeGate, holdAt, MODE_FADE_SECONDS, monoGain, rampLinear, setParam, stereoGain } from './nodeUtils'
+import { BUTTERWORTH_Q_DB, dbToGain, fadeGate, holdAt, linearRampAt, MODE_FADE_SECONDS, monoGain, rampLinear, setParam, stereoGain } from './nodeUtils'
 import { ReverbBus } from './reverbBus'
 import { createTail, type TailChain } from './tailEngine'
 import type { TailReport } from './tailTypes'
@@ -143,11 +144,152 @@ function direction(azimuthDeg: number, elevationDeg: number): [number, number, n
   return [Math.sin(az) * Math.cos(el), Math.sin(el), -Math.cos(az) * Math.cos(el)]
 }
 
-function setPannerDirection(ctx: BaseAudioContext, p: PannerNode, azimuthDeg: number, elevationDeg: number, smooth: boolean) {
-  const [x, y, z] = direction(azimuthDeg, elevationDeg)
-  setParam(ctx, p.positionX, x, smooth, 0.05)
-  setParam(ctx, p.positionY, y, smooth, 0.05)
-  setParam(ctx, p.positionZ, z, smooth, 0.05)
+/**
+ * 複数の出力を 2 入力ずつの木で足し合わせる。1 つの入力に 3 つ以上を接続すると、ブラウザが足す順序が
+ * レンダリングごとに変わり（浮動小数点の丸めの違いで）同じ設定でも出力がわずかに変わる（12 個の HRTF の和で
+ * −135 dB、Motion の後段で −110 dB を実測）。2 つの和は順序によらないため、木にすると毎回同じ値になる
+ */
+function sumTree(ctx: BaseAudioContext, nodes: AudioNode[]): AudioNode {
+  let level = nodes
+  while (level.length > 1) {
+    const next: AudioNode[] = []
+    for (let i = 0; i < level.length; i += 2) {
+      if (i + 1 >= level.length) {
+        next.push(level[i])
+        continue
+      }
+      const g = stereoGain(ctx)
+      level[i].connect(g)
+      level[i + 1].connect(g)
+      next.push(g)
+    }
+    level = next
+  }
+  return level[0]
+}
+
+interface SwitchedDelay {
+  output: AudioNode
+  setDelay(seconds: number, smooth: boolean): void
+}
+
+/**
+ * 遅延時間を変えられる遅延（ステレオ）。DelayNode の delayTime を自動化すると、Chrome では固定の遅延から
+ * 自動化に切り替わる瞬間に出力が飛ぶ（Phase 05 のプリセット切替で実測）。固定の遅延を 2 つ持ち、
+ * 無音側に新しい遅延を設定してからゲインをクロスフェードで入れ替える（createHrtfVoice と同じ方式）
+ */
+function createSwitchedDelay(ctx: BaseAudioContext, input: AudioNode, seconds: number, maxSeconds: number): SwitchedDelay {
+  const output = stereoGain(ctx)
+  const slots = [1, 0].map((g) => {
+    const delay = new DelayNode(ctx, { maxDelayTime: maxSeconds, delayTime: seconds, channelCount: 2, channelCountMode: 'explicit' })
+    const gain = stereoGain(ctx, g)
+    input.connect(delay).connect(gain).connect(output)
+    return { delay, gain, value: seconds }
+  })
+  let active = 0
+  let busyUntil = 0
+  let pendingStart = -1
+  const place = (slot: (typeof slots)[number], v: number, at: number | null) => {
+    if (at === null) setParam(ctx, slot.delay.delayTime, v, false)
+    else {
+      slot.delay.delayTime.cancelScheduledValues(at)
+      slot.delay.delayTime.setValueAtTime(v, at)
+    }
+    slot.value = v
+  }
+  return {
+    output,
+    setDelay(v, smooth) {
+      const now = ctx.currentTime
+      if (!smooth) {
+        for (const slot of slots) place(slot, v, null)
+        return
+      }
+      if (pendingStart > now) {
+        place(slots[active], v, pendingStart)
+        return
+      }
+      const cur = slots[active]
+      if (cur.value === v) return
+      const start = Math.max(now, busyUntil)
+      const next = slots[1 - active]
+      place(next, v, start)
+      linearRampAt(next.gain.gain, start, 1, start + HRTF_SWAP_SECONDS)
+      linearRampAt(cur.gain.gain, start, 0, start + HRTF_SWAP_SECONDS)
+      active = 1 - active
+      busyUntil = start + HRTF_SWAP_SECONDS
+      pendingStart = start
+    },
+  }
+}
+
+/** HRTF の方向を変えるときのクロスフェード（秒） */
+const HRTF_SWAP_SECONDS = 0.06
+
+interface HrtfVoice {
+  input: AudioNode
+  output: AudioNode
+  setDirection(azimuthDeg: number, elevationDeg: number, smooth: boolean): void
+}
+
+/**
+ * 方向を変えられる HRTF 音源。PannerNode の位置は自動化しない（HRTF の位置を連続的に動かすと、
+ * ブラウザ内部の HRIR の切替が繰り返されてクリックが出る。Phase 05 のプリセット切替で実測）。
+ * 固定方向のパンナーを 2 つ持ち、無音側に新しい方向を設定してからゲインをクロスフェードで入れ替える。
+ * 無音側のパンナーは入力が無音なので、ブラウザが処理を省略する
+ */
+function createHrtfVoice(ctx: BaseAudioContext, azimuthDeg: number, elevationDeg: number): HrtfVoice {
+  const input = monoGain(ctx)
+  const output = stereoGain(ctx)
+  const slots = [1, 0].map((g) => {
+    const gain = monoGain(ctx, g)
+    const panner = createHrtfPanner(ctx, azimuthDeg, elevationDeg)
+    input.connect(gain).connect(panner).connect(output)
+    return { gain, panner, az: azimuthDeg, el: elevationDeg }
+  })
+  let active = 0
+  let busyUntil = 0
+  /** 最後に予約した入れ替えの開始時刻 */
+  let pendingStart = -1
+  const place = (slot: (typeof slots)[number], az: number, el: number, at: number | null) => {
+    const v = direction(az, el)
+    ;[slot.panner.positionX, slot.panner.positionY, slot.panner.positionZ].forEach((p, i) => {
+      if (at === null) setParam(ctx, p, v[i], false)
+      else {
+        p.cancelScheduledValues(at)
+        p.setValueAtTime(v[i], at)
+      }
+    })
+    slot.az = az
+    slot.el = el
+  }
+  return {
+    input,
+    output,
+    setDirection(az, el, smooth) {
+      const now = ctx.currentTime
+      if (!smooth) {
+        for (const slot of slots) place(slot, az, el, null)
+        return
+      }
+      // 予約済みの入れ替えがまだ始まっていなければ、その方向を差し替える（スライダー操作で入れ替えが溜まらない）
+      if (pendingStart > now) {
+        place(slots[active], az, el, pendingStart)
+        return
+      }
+      const cur = slots[active]
+      if (cur.az === az && cur.el === el) return
+      // 前の入れ替えが終わってから（無音になった側だけに新しい方向を設定する）
+      const start = Math.max(now, busyUntil)
+      const next = slots[1 - active]
+      place(next, az, el, start)
+      linearRampAt(next.gain.gain, start, 1, start + HRTF_SWAP_SECONDS)
+      linearRampAt(cur.gain.gain, start, 0, start + HRTF_SWAP_SECONDS)
+      active = 1 - active
+      busyUntil = start + HRTF_SWAP_SECONDS
+      pendingStart = start
+    },
+  }
 }
 
 function reflectionAzimuth(sign: number, speakerAngle: number, r: (typeof CINEMA_REFLECTIONS)[number]): number {
@@ -170,8 +312,8 @@ function createCinema(ctx: BaseAudioContext, p: SpatialParams, hrtfLatencySecond
 
   interface SideNodes {
     sign: number
-    direct: { air: BiquadFilterNode; gain: GainNode; gate: GainNode; panner: PannerNode }
-    refl: { delay: DelayNode; gain: GainNode; panner: PannerNode }[]
+    direct: { air: BiquadFilterNode; gain: GainNode; gate: GainNode; voice: HrtfVoice }
+    refl: { delay: DelayNode; gain: GainNode; voice: HrtfVoice }[]
   }
   const sides: SideNodes[] = [0, 1].map((c) => {
     const sign = c === 0 ? -1 : 1
@@ -181,16 +323,18 @@ function createCinema(ctx: BaseAudioContext, p: SpatialParams, hrtfLatencySecond
     const gain = monoGain(ctx, s.directGain)
     // Motion ON 時に直接音だけを止めるゲート（通常は 1）
     const gate = monoGain(ctx, 1)
-    const panner = createHrtfPanner(ctx, sign * s.speakerAngleDeg, 0)
-    src.connect(air).connect(gain).connect(gate).connect(panner).connect(sum)
-    const direct = { air, gain, gate, panner }
+    const voice = createHrtfVoice(ctx, sign * s.speakerAngleDeg, 0)
+    src.connect(air).connect(gain).connect(gate).connect(voice.input)
+    voice.output.connect(sum)
+    const direct = { air, gain, gate, voice }
     const refl = CINEMA_REFLECTIONS.map((r) => {
       const delay = new DelayNode(ctx, { maxDelayTime: 0.1, delayTime: reflectionDelaySeconds(r.baseDelayMs, s.roomScale, s.itdgScale) })
       const lp = new BiquadFilterNode(ctx, { type: 'lowpass', frequency: r.lowpassHz, Q: BUTTERWORTH_Q_DB })
       const gain = monoGain(ctx, r.gain * s.reflectionLevel)
-      const panner = createHrtfPanner(ctx, reflectionAzimuth(sign, s.speakerAngleDeg, r), r.elevationDeg)
-      src.connect(delay).connect(lp).connect(gain).connect(panner).connect(sum)
-      return { delay, gain, panner }
+      const voice = createHrtfVoice(ctx, reflectionAzimuth(sign, s.speakerAngleDeg, r), r.elevationDeg)
+      src.connect(delay).connect(lp).connect(gain).connect(voice.input)
+      voice.output.connect(sum)
+      return { delay, gain, voice }
     })
     return { sign, direct, refl }
   })
@@ -207,12 +351,12 @@ function createCinema(ctx: BaseAudioContext, p: SpatialParams, hrtfLatencySecond
       for (const side of sides) {
         setParam(ctx, side.direct.air.frequency, n.airLowpassHz, smooth)
         setParam(ctx, side.direct.gain.gain, n.directGain, smooth)
-        setPannerDirection(ctx, side.direct.panner, side.sign * n.speakerAngleDeg, 0, smooth)
+        side.direct.voice.setDirection(side.sign * n.speakerAngleDeg, 0, smooth)
         side.refl.forEach((nodes, i) => {
           const r = CINEMA_REFLECTIONS[i]
           setParam(ctx, nodes.delay.delayTime, reflectionDelaySeconds(r.baseDelayMs, n.roomScale, n.itdgScale), smooth, 0.1)
           setParam(ctx, nodes.gain.gain, r.gain * n.reflectionLevel, smooth)
-          setPannerDirection(ctx, nodes.panner, reflectionAzimuth(side.sign, n.speakerAngleDeg, r), r.elevationDeg, smooth)
+          nodes.voice.setDirection(reflectionAzimuth(side.sign, n.speakerAngleDeg, r), r.elevationDeg, smooth)
         })
       }
     },
@@ -359,11 +503,15 @@ interface MotionChain {
   input: AudioNode
   /** 12 方向の固定 HRTF で描画した直接音（バイノーラル） */
   ring: AudioNode
-  /** 原音を STFT 遅延分遅らせた L/R（CINEMA の反射音の送り） */
+  /** 原音を STFT 遅延 + CENTER の基準距離の伝搬遅延だけ遅らせた L/R（CINEMA の反射音の送り） */
   aligned: AudioNode
   /** さらに HRTF の遅延分遅らせた L/R（HRTF を通らない HALL の初期反射・残響の送り） */
   alignedHall: AudioNode
   latencySeconds: number
+  /** CINEMA の反射音への送りの遅延（CENTER の基準距離の伝搬遅延、秒） */
+  feedDelaySeconds(): number
+  /** 基準距離が変わったときに送りの遅延を合わせる */
+  setFeedDelay(seconds: number, smooth: boolean): void
   post(message: MotionMessage): void
   onReport(listener: ((r: MotionReport) => void) | null): void
 }
@@ -373,6 +521,9 @@ interface MotionChain {
  *   input ─→ [csx-motion] ─ 出力0（12ch）→ 12 方向の固定 HRTF → 音色補正 EQ → ring
  *                        └ 出力1（遅延をそろえた原音 L/R）→ aligned / alignedHall
  * 反射音・残響は既存の CINEMA / HALL チェーンの部品を、入力を aligned に切り替えて再利用する（二重に持たない）。
+ * CINEMA の反射音への送りは CENTER の基準距離の伝搬遅延だけ遅らせる（直接音は距離に応じて遅れるため、遅らせないと
+ * 2〜19 ms の反射音が直接音より先に届く。Phase 05 で修正）。HALL の初期反射（9 ms × 部屋の倍率〜）・後期残響の送り
+ * （alignedHall）は従来どおり: 既定の設定では直接音より後に届き、変えると Phase 04 で調整した反射音の追従の性質が変わるため
  */
 function createMotion(
   ctx: BaseAudioContext,
@@ -403,21 +554,24 @@ function createMotion(
 
   const split = new ChannelSplitterNode(ctx, { numberOfOutputs: SPEAKER_COUNT })
   worklet.connect(split, 0)
-  const ringSum = stereoGain(ctx)
-  SPEAKER_AZIMUTHS.forEach((az, i) => {
+  const panners = SPEAKER_AZIMUTHS.map((az, i) => {
     const panner = createHrtfPanner(ctx, az, 0)
     split.connect(panner, i)
-    panner.connect(ringSum)
+    return panner
   })
+  const ringSum = sumTree(ctx, panners)
   const ring = CINEMA_TIMBRE_EQ.reduce<AudioNode>(
     (prev, b) => prev.connect(new BiquadFilterNode(ctx, { type: b.type, frequency: b.frequency, Q: b.q ?? 1, gain: b.gainDb })),
     ringSum,
   )
 
-  const aligned = stereoGain(ctx)
-  worklet.connect(aligned, 1)
+  let feedDelay = distanceDelaySeconds(motionLayout(p).baseDistance)
+  const aux = stereoGain(ctx)
+  worklet.connect(aux, 1)
+  const feed = createSwitchedDelay(ctx, aux, feedDelay, 0.05)
+  const aligned = feed.output
   const alignedHall = new DelayNode(ctx, { maxDelayTime: 0.1, delayTime: hrtfLatencySeconds, channelCount: 2, channelCountMode: 'explicit' })
-  aligned.connect(alignedHall)
+  aux.connect(alignedHall)
 
   let reportListener: ((r: MotionReport) => void) | null = null
   // 通知を使うときだけ受信する（onmessage を設定した MessagePort は閉じるまで GC されず、解析用の OfflineAudioContext ごと残るため）
@@ -429,6 +583,12 @@ function createMotion(
     aligned,
     alignedHall,
     latencySeconds: MOTION_FFT_SIZE / ctx.sampleRate + hrtfLatencySeconds,
+    feedDelaySeconds: () => feedDelay,
+    setFeedDelay(seconds, smooth) {
+      if (seconds === feedDelay) return
+      feedDelay = seconds
+      feed.setDelay(seconds, smooth)
+    },
     post: (m) => worklet.port.postMessage(m),
     onReport(listener) {
       reportListener = listener
@@ -462,6 +622,10 @@ export interface SpatialGraph {
   resetReverb(at: number, fadeSeconds: number): void
   /** Dynamic Tail・蓄積防止の状態の通知 */
   onTailReport(listener: ((r: TailReport) => void) | null): void
+  /** ORIGINAL 経路の時刻合わせの遅延（秒）。時刻合わせなしなら null */
+  bypassAlignSeconds(): number | null
+  /** 処理経路で原音（中央の音）が出てくるまでの遅延（秒、現在の設定の目標値）。ORIGINAL の時刻合わせに使う */
+  latencySeconds(): number
   /** テスト用: Dynamic Tail のゲイン（モノラル）と、畳み込みの組の数 */
   debug: { tailGain: AudioNode | null; reverbSlots(): number }
 }
@@ -484,6 +648,11 @@ export interface SpatialGraphOptions {
     envelope?: Envelope | null
     reportIntervalMs?: number
   }
+  /**
+   * ORIGINAL/PROCESSED 比較の時刻合わせ: bypassDry 経路を処理経路と同じ遅延（整数サンプル）にする。
+   * 事前に loadAlignWorklet が必要。省略時は遅らせない（bypassDry = 入力と同時刻でビット一致）
+   */
+  alignBypass?: boolean
 }
 
 interface ChainSlot {
@@ -507,7 +676,7 @@ const DISCONNECT_MARGIN_SECONDS = 0.1
 /**
  * 空間処理グラフ:
  *
- *   input ─┬─ bypassDry ──────────────────────────────────────────────────────────────────┬─ output
+ *   input ─┬─ [時刻合わせ] ─ bypassDry ─────────────────────────────────────────────────────┬─ output
  *          └─ ステレオ化 ─┬─ [WIDE | CINEMA | HALL]（選択中のみ）──────────────→ wet ┐       │
  *                        ├─ [MOTION] ─ 直接音（12 方向 HRTF）──────────────→ wet │       │
  *                        │           └ 遅延をそろえた原音 → CINEMA/HALL の入力   │       │
@@ -516,13 +685,15 @@ const DISCONNECT_MARGIN_SECONDS = 0.1
  * Motion ON（CINEMA / HALL）: モードのチェーンの直接音を止め、入力を Motion の遅延をそろえた原音に切り替えて
  * 反射音・残響だけを使う。直接音は Motion の 12 方向 HRTF が担当する。
  * bypassDry 経路はゲイン 1 のみで原音とビット一致する。
+ * 時刻合わせ（alignBypass）: bypassDry を処理経路の遅延だけ整数サンプルで遅らせる（遅延した原音とビット一致）。
+ * 遅延の変更は bypassDry が無音（PROCESSED を再生中）のときだけ行い、ORIGINAL 試聴中は変えない。
  */
 export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOptions): SpatialGraph {
   const input = new GainNode(ctx)
   const output = new GainNode(ctx)
   const bypassDry = new GainNode(ctx, { gain: opts.bypass ? 1 : 0 })
   const bypassWet = new GainNode(ctx, { gain: opts.bypass ? 0 : 1 })
-  input.connect(bypassDry).connect(output)
+  bypassDry.connect(output)
 
   const root = stereoGain(ctx)
   input.connect(root)
@@ -643,6 +814,23 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
   let current = { mode: opts.params.mode, motion: initialMotion, tail: tailOn(opts.params) }
   let currentParams = opts.params
 
+  // ORIGINAL の時刻合わせの目標 = 処理経路で原音（中央の音）が出てくるまでの遅延:
+  // モードの遅延（Motion の STFT・HRTF）+ 出力段リミッターの先読み + Motion の CENTER の伝搬遅延（基準距離の分、固定）
+  const outputLatency = opts.useWorklet ? dynamicsSettingsFor('normal', LIMITER_ONLY_BASS_THRESHOLD_DB, 0).lookaheadMs / 1000 : 0
+  const compareLatencyOf = (p: SpatialParams) =>
+    p.mode === 'off' ? 0 : latencyOf(p) + outputLatency + (motionOn(p) ? distanceDelaySeconds(motionLayout(p).baseDistance) : 0)
+  const bypassAlign = opts.alignBypass ? createAlignDelay(ctx, compareLatencyOf(opts.params)) : null
+  if (bypassAlign) input.connect(bypassAlign.node).connect(bypassDry)
+  else input.connect(bypassDry)
+  let bypassed = opts.bypass
+  /** bypassDry が 0 になり終わる ctx 時刻（PROCESSED へ切り替えたときのフェードの終点） */
+  let dryFadeEnd = 0
+  /** PROCESSED 再生中に、BYPASS 経路の遅延を処理経路に合わせる（bypassDry が無音になってから） */
+  const syncBypassAlign = () => {
+    if (!bypassAlign || bypassed) return
+    bypassAlign.setDelay(compareLatencyOf(currentParams), Math.max(ctx.currentTime, dryFadeEnd))
+  }
+
   let worklet: AudioWorkletNode | null = null
   let trim: GainNode | null = null
   let meterListener: ((m: DynamicsMeter) => void) | null = null
@@ -680,6 +868,7 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
       for (const m of modes) slots[m]?.chain.update(p, smooth)
       // Motion の位置・パラメーター（OFF ならワークレットはフェード後に休止する）
       motion?.post({ type: 'params', layout: motionLayout(p), control: motionControl(p) })
+      motion?.setFeedDelay(distanceDelaySeconds(motionLayout(p).baseDistance), smooth)
       tail?.update(p, smooth)
 
       const next = { mode: p.mode, motion: motionOn(p), tail: tailOn(p) }
@@ -738,6 +927,7 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
         } else setParam(ctx, dryAlign.delayTime, latencyOf(p), false)
       }
       current = next
+      syncBypassAlign()
     },
     setTrimDb(db, smooth = true) {
       if (worklet) worklet.port.postMessage({ trimDb: db })
@@ -747,6 +937,18 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
       slots.wide?.chain.setSideCap?.(capDb, smooth)
     },
     setBypass(b, smooth) {
+      const now = ctx.currentTime
+      if (bypassAlign) {
+        // ORIGINAL へ: bypassDry が無音なら、鳴り始める前に処理経路と同じ遅延にする（フェードは 0 から始まる）。
+        // まだフェードアウト中（PROCESSED へ切り替えた直後）なら、聞こえている遅延のまま戻す
+        if (b && now >= dryFadeEnd) bypassAlign.setDelay(compareLatencyOf(currentParams), now)
+        else if (b) bypassAlign.cancelPending()
+      }
+      bypassed = b
+      if (!b) {
+        dryFadeEnd = now + (smooth ? BYPASS_FADE_SECONDS : 0)
+        syncBypassAlign()
+      }
       for (const [node, target] of [
         [bypassDry, b ? 1 : 0],
         [bypassWet, b ? 0 : 1],
@@ -772,6 +974,7 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
     resetReverb(at, fadeSeconds) {
       // at はグラフ入力の時刻。各チェーンの入力までの遅延（Motion の STFT・HRTF の遅延合わせ）を足して、
       // 「at 以降に入った音の残響」だけが新しい畳み込みに入るようにする
+      // HALL の後期残響・Tail の送りは alignedHall（CENTER の伝搬遅延なし）
       const motionFeed = motion && motionOn(currentParams) ? motion.latencySeconds : null
       slots.hall?.chain.resetLate?.(at + (motionFeed ?? 0), fadeSeconds)
       tail?.reset(at + (motionFeed ?? tailRootDelayFor(currentParams)), fadeSeconds)
@@ -779,6 +982,8 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
     onTailReport(listener) {
       tail?.onReport(listener)
     },
+    bypassAlignSeconds: () => (bypassAlign ? bypassAlign.frames / ctx.sampleRate : null),
+    latencySeconds: () => compareLatencyOf(currentParams),
     debug: {
       tailGain: tail?.gainProbe ?? null,
       reverbSlots: () => tail?.slotCount ?? 0,

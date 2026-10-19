@@ -20,6 +20,8 @@ export interface TestResult {
   name: string
   pass: boolean
   detail: string
+  /** 合否を判定しない測定値（原因調査など）。PASS / FAIL の件数に含めない */
+  info?: boolean
 }
 
 const RATE = TEST_RATE

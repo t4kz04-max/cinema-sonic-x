@@ -77,7 +77,7 @@ export function EnhancementPanel({ player }: EnhancementPanelProps) {
 
   return (
     <Panel
-      index="05"
+      index="06"
       label="ENHANCE"
       title="重低音エンジン"
       className={`panel--enhance${extreme ? ' is-extreme' : ''}`}

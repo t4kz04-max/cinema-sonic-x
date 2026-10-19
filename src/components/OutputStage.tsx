@@ -17,6 +17,7 @@ const ANALYSIS_LABEL: Record<DspStatus['analysis'], string> = {
   ready: '適用中',
   silent: '無音のため補正なし',
   error: '計測失敗（直前の値を維持）',
+  standby: '重低音 OFF（ON にすると計測）',
 }
 
 const TRIM_REASON: Record<DspStatus['trimReason'], string> = {

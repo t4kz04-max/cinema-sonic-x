@@ -3,6 +3,7 @@ import './App.css'
 import { AppHeader } from './components/AppHeader'
 import { EnhancementPanel } from './components/EnhancementPanel'
 import { ExportPanel } from './components/ExportPanel'
+import { PresetPanel } from './components/PresetPanel'
 import { SourceInfoPanel } from './components/SourceInfoPanel'
 import { SpatialPanel } from './components/SpatialPanel'
 import { SpectrumPanel } from './components/SpectrumPanel'
@@ -63,6 +64,7 @@ function App() {
         </div>
         <div className="console__col console__col--main">
           <TransportPanel player={player} />
+          <PresetPanel player={player} />
           <SpatialPanel player={player} />
           <EnhancementPanel player={player} />
           <SpectrumPanel dsp={player.dsp} bypass={bypass || !player.bassEnabled} />
@@ -70,7 +72,7 @@ function App() {
       </main>
       <footer className="app-footer">
         <span>音源はお使いのブラウザ内でのみ処理されます。サーバーや外部サービスへは送信されません。</span>
-        <span className="mono">CINEMA SONIC X · Spatial Prototype</span>
+        <span className="mono">CINEMA SONIC X · Spatial Presets (Phase 05)</span>
       </footer>
     </div>
   )

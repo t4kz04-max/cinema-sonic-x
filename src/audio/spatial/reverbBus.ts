@@ -100,8 +100,13 @@ export class ReverbBus {
     const stale = this.pool.splice(0)
     const t = this.ctx.currentTime
     const smooth = !!old && fadeSeconds > 0
-    const next = this.makeSlot(buffer, 1, smooth ? 0 : 1)
-    if (smooth) linearRampAt(next.out.gain, t, 1, t + fadeSeconds)
+    // 新しい組の入力も HANDOFF_SECONDS で立ち上げる（入力を瞬時に入れると、持続音が途中から
+    // 立ち上がり直した形になり、新しい残響の頭に広帯域の「チッ」が出る。Phase 05 のプリセット切替で実測）
+    const next = this.makeSlot(buffer, smooth ? 0 : 1, smooth ? 0 : 1)
+    if (smooth) {
+      linearRampAt(next.inGate.gain, t, 1, t + HANDOFF_SECONDS)
+      linearRampAt(next.out.gain, t, 1, t + fadeSeconds)
+    }
     for (const s of stale) {
       if (s === old && smooth) linearRampAt(s.out.gain, t, 0, t + fadeSeconds)
       else setValueAt(s.out.gain, t, 0)

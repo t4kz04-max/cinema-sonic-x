@@ -1,5 +1,6 @@
 import { CROSSOVER_HZ, DEFAULT_BASS_THRESHOLD_DB, MODE_SPECS, type BassParams } from './bassSpec'
 import { eqCapScale, maxEqGainDb } from './biquadMath'
+import { countAnalysisRender } from './analysisStats'
 import type { DynamicsSettings } from './dynamicsTypes'
 import { blockPeakPercentileDb, computeTrim, integratedLoudness, linearToDb, samplePeak, type TrimResult } from './loudness'
 import { createProcessingGraph, dynamicsSettingsFor, loadDynamicsWorklet } from './processingGraph'
@@ -44,7 +45,9 @@ export function buildAnalysisExcerpt(buffer: AudioBuffer): AudioBuffer {
 async function renderExcerpt(
   excerpt: AudioBuffer,
   build: (ctx: OfflineAudioContext, src: AudioBufferSourceNode) => Promise<AudioNode> | AudioNode,
+  worklet = false,
 ): Promise<Float32Array[]> {
+  countAnalysisRender(worklet)
   const length = Math.max(1, Math.ceil(excerpt.duration * ANALYSIS_SAMPLE_RATE))
   const ctx = new OfflineAudioContext(Math.min(excerpt.numberOfChannels, 2), length, ANALYSIS_SAMPLE_RATE)
   const src = new AudioBufferSourceNode(ctx, { buffer: excerpt })
@@ -135,7 +138,7 @@ async function renderProcessed(
     graph.setMakeupCancel(opts.makeupCancel, false)
     src.connect(graph.input)
     return graph.output
-  })
+  }, opts.useWorklet)
 }
 
 /**

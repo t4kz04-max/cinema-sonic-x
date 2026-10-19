@@ -10,8 +10,8 @@
 | 02.5 | EXTREME BASS・出力補正の再設計・スペクトル比較 | 実装済み（実楽曲での試聴確認待ち） |
 | SP | Spatial Audio Prototype（WIDE / CINEMA / HALL）※ docs/SPATIAL.md | 実装済み（試聴: CINEMA・HALL は効果あり、WIDE は小） |
 | 03 | Dynamic Spatial Motion Engine | 実装済み・Chrome/Edge で検証済み（実楽曲での試聴は未実施） |
-| 04 | Immersive Audio Engine 2.0（Spatial Tail・Dynamic Tail・Loop） | 実装済み・Chrome/Edge で検証（1 件 FAIL、下記）。試聴は未実施 |
-| 05 | Spatial Preset System | 未着手 |
+| 04 | Immersive Audio Engine 2.0（Spatial Tail・Dynamic Tail・Loop） | 実装済み・Chrome/Edge で検証（1 件 FAIL、下記。原因は Phase 05 で特定）。試聴は未実施 |
+| 05 | Spatial Preset System | 実装済み・Chrome/Edge で検証（test:preset 全 PASS。既存試験に Phase 05 の修正で現れた FAIL 4 件、下記）。試聴は未実施 |
 | 06 | Audio Export Engine | 未着手 |
 | 07 | Video Processing Engine | 未着手 |
 | 08 | Simple UI + Studio | 未着手 |
@@ -181,7 +181,7 @@ source → input ─┬─ dry(1/0) ──────────────�
 - [x] Motion と残響の統合（既定値の SWEEP の ILD 変化幅 約 11 dB → 16.1 / 17.6 dB、追従相関 0.95 / 0.97。後期残響は不変）
 - [x] NORMAL LOOP / SPATIAL LOOP が動作する（オフライン 60 秒 × 2、実時間の再生エンジン 60 秒、実アプリの UI で確認）
 - [x] STOP / PAUSE / CUT が動作する（オフライン検証と実アプリの出力レベルで確認）
-- [x] Chrome / Edge で test:tail・test:spatial・test:dsp を実行（test:tail 96/97: Motion＋Tail＋Dynamic の 1 条件でラウドネス -1.3 LU が基準 ±1 LU を外れる）
+- [x] Chrome / Edge で test:tail・test:spatial・test:dsp を実行（test:tail 96/97: HALL×SWEEP×RIPPLE+DYNAMIC でラウドネス -1.3 LU が基準 ±1 LU を外れる。原因は HALL + Motion のピーク対ラウドネス比の上昇で、Dynamic Tail ではない — Phase 05 で測定）
 - [x] build / lint 成功
 - [ ] 実楽曲・ヘッドホンでの試聴（未実施）
 
@@ -189,11 +189,32 @@ source → input ─┬─ dry(1/0) ──────────────�
 
 ## Phase 05 — Spatial Preset System
 
+これまでの空間処理を 4 つの完成版プリセットに統合し、ワンクリックで使えるようにした。詳細・設定値・測定結果は docs/SPATIAL.md。
+
+**実装内容**
+- プリセット 4 種（CINEMA 3D / LIVE ARENA / 360° MOTION / IMMERSIVE X）: 凍結した型付き設定（ID・表示名・説明・効果・既知の制限・版・Room / Motion / Tail / Bass）。`presetToDsp` で再生エンジンの `DspConfig` に一対一で写す
+- プリセットパネル（カード・選択状態・実際の DSP 値・既知の制限）、ORIGINAL / PROCESSED 比較（時刻合わせ・ラウドネス差の表示）、CUSTOM（詳細設定の変更を検出、ブラウザ内保存・読み込み・削除、失敗時のメッセージ）
+- 再生・オフラインで共通のチェーン構築 `createOutputChain`（Phase 06 の書き出しで再利用する）
+- ORIGINAL 経路の時刻合わせ（整数サンプル遅延のワークレット。遅延した原音とビット一致）
+- 空間のラウドネス合わせを重低音段を含むチェーン全体で行う
+- 解析の最適化: 処理計画のキャッシュ（24 件）・重複実行の防止・重低音 OFF 中は解析しない・ワークレットなしの解析・リミッターが働かない場合の 2 回目のレンダリングの省略
+- Phase 04 の既知 FAIL の原因調査（HALL + Motion でピーク対ラウドネス比が約 4 dB 上がる）→ 標準プリセットから HALL + Motion を除外
+- Phase 05 で見つけた既存の不具合の修正: Motion ON・Tail OFF の解析が反射音を含まずトリムが過大（リミッターが予算超過）、Motion ON の CINEMA で反射音が直接音より先に届く、CINEMA の INTENSITY 変更・IR の切替・遅延の変更でのクリック、HRTF の和の順序によるレンダリングごとの微小な違い
+
 **完了条件**
-- [ ] 「立体音響プリセット」（例: 映画館 / ライブ / ナチュラル）を、重低音・空間・Motion の全パラメーターの組として定義
-- [ ] プリセットを選ぶだけで処理が切り替わり、各プリセットの処理内容を説明として表示
-- [ ] プリセットのシリアライズ（バージョン付き）と、ユーザー設定の保存・復元
-- [ ] プリセット切替時にクリックノイズなし、出力ピーク ≤ -1 dBFS
+- [x] 4 つのプリセットが正しく適用され、それぞれ異なる DSP 設定を使う（再生エンジンの設定 = プリセット、出力の差を測定）
+- [x] 切替時のクリックなし（プリセット切替 1.00〜1.04、A/B 切替 1.00〜1.21、基準 ≤ 1.5）
+- [x] ORIGINAL / PROCESSED: 時刻合わせ（直接音の到達の差 ≤ 0.17 ms）・ラウドネス（全チェーンで原音比 −0.9〜−0.2 LU、基準 ±1 LU）・二重再生なし・位置の連続
+- [x] CUSTOM・設定の保存（失敗時も再生を壊さない）
+- [x] Motion・Tail の再現性、ループとの連携、出力ピーク、位相、モノラル互換性、CPU（22〜31%）、メモリ（2 周目以降の増加なし）
+- [x] Chrome / Edge で test:preset（133/133 + INFO 15）・test:spatial・test:tail・test:dsp を 1 スイートずつ実行
+- [x] 実アプリ（Chrome / Edge）で UI 操作を確認（コンソールのエラーなし）
+- [x] build / lint 成功
+- [ ] 実楽曲・ヘッドホンでの試聴（未実施）
+
+**既存の試験の FAIL（Phase 05 の修正で現れた正しい測定値。基準は変えていない）**: test:spatial の Motion で HALL × CINEMATIC / ORBIT / SWEEP のラウドネス −1.1〜−1.3 LU（解析の修正）、CINEMA × SWEEP の LEFT の ILD 変化幅 13.6 dB（基準 15 dB、反射音の順序の修正）。
+
+**既知の制限**: 解析用の文脈が 1 つあたり約 23 MB 残る（ブラウザの制限。キャッシュで同じ設定の再解析はなくなった）。密なマスターではラウドネスの余裕が小さい（−0.9 LU まで）。詳細は docs/SPATIAL.md。
 
 ## Phase 06 — Audio Export Engine
 

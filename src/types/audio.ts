@@ -29,8 +29,9 @@ export interface DspStatus {
   /**
    * idle: 音源未読み込み / measuring: 計測中 / ready: 適用済み
    * silent: 無音のため計測不能（補正 0 dB） / error: 計測失敗（直前の値を維持）
+   * standby: 重低音 OFF のため未計測（ON にすると計測。解析用の文脈を無駄に作らない）
    */
-  analysis: 'idle' | 'measuring' | 'ready' | 'silent' | 'error'
+  analysis: 'idle' | 'measuring' | 'ready' | 'silent' | 'error' | 'standby'
   /** worklet: 低域コンプ＋サンプルピークリミッター / fallback: AudioWorklet 非対応時の簡易コンプ */
   dynamicsEngine: 'worklet' | 'fallback' | null
   trimDb: number
@@ -46,6 +47,15 @@ export interface DspStatus {
   /** フォールバックのコンプ・メイクアップ打消し（dB）。未計測は null */
   makeupCancelDb: number | null
   spatial: SpatialStatus
+  compare: CompareStatus
+}
+
+/** ORIGINAL/PROCESSED 比較と解析の状態 */
+export interface CompareStatus {
+  /** ORIGINAL 経路の時刻合わせ（ms、処理経路の遅延と同じ）。時刻合わせが使えない環境では null */
+  alignMs: number | null
+  /** 解析用 OfflineAudioContext の作成回数（うち AudioWorklet を読み込んだもの）と、キャッシュから反映した回数 */
+  analysis: { renders: number; workletRenders: number; cacheHits: number }
 }
 
 export interface SpatialStatus {

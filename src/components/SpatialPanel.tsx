@@ -239,7 +239,7 @@ function MetricsTable({ before, after, status }: { before: StereoMetrics | null;
         </div>
       </dl>
       <p className="output-stage__note">
-        曲の抜粋（最大 15 秒）を実際の空間処理グラフでオフライン処理して測定。音色の変化 = 125 Hz〜8 kHz の 1/3 オクターブで、全体の音量差を除いた最大のずれ。
+        曲の抜粋（最大 15 秒）を実際の空間処理グラフでオフライン処理して測定（重低音 ON のときは重低音段を含むチェーン全体）。音色の変化 = 125 Hz〜8 kHz の 1/3 オクターブで、全体の音量差を除いた最大のずれ。
       </p>
     </div>
   )
@@ -256,9 +256,9 @@ export function SpatialPanel({ player }: SpatialPanelProps) {
 
   return (
     <Panel
-      index="04"
+      index="05"
       label="SPATIAL"
-      title="空間音響プロトタイプ"
+      title="空間音響の詳細設定"
       className="panel--spatial"
       aside={
         <>

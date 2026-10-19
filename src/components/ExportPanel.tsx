@@ -3,11 +3,11 @@ import { Badge, Panel } from './Panel'
 export function ExportPanel() {
   return (
     <Panel
-      index="07"
+      index="08"
       label="EXPORT"
       title="書き出し"
       className="panel--export"
-      aside={<Badge tone="locked">Phase 04</Badge>}
+      aside={<Badge tone="locked">Phase 06</Badge>}
     >
       <dl className="spec-list spec-list--compact">
         <div className="spec-list__row">
@@ -23,7 +23,7 @@ export function ExportPanel() {
         WAVを書き出す
       </button>
       <p id="export-note" className="empty-note">
-        WAV書き出しは未実装です。重低音処理（Phase 02/03）の実装後、Phase 04 で有効になります。
+        WAV書き出しは未実装です（Phase 06 で実装予定）。
       </p>
     </Panel>
   )

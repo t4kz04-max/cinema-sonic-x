@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "test:dsp": "node scripts/run-dsp-selftest.mjs",
     "test:spatial": "node scripts/run-dsp-selftest.mjs --spatial",
-    "test:tail": "node scripts/run-dsp-selftest.mjs --tail"
+    "test:tail": "node scripts/run-dsp-selftest.mjs --tail",
+    "test:preset": "node scripts/run-dsp-selftest.mjs --preset"
   },
   "dependencies": {
     "react": "^19.2.8",

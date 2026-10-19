@@ -1,8 +1,12 @@
+import { countAnalysisRender } from '../analysisStats'
 import { blockPeakPercentileDb, integratedLoudness, linearToDb, samplePeak } from '../loudness'
-import { loadDynamicsWorklet } from '../processingGraph'
+import type { BassParams } from '../bassSpec'
+import type { DynamicsSettings } from '../dynamicsTypes'
+import { createProcessingGraph, loadDynamicsWorklet } from '../processingGraph'
 import { monoColorationDb, stereoColorationDb, stereoMetrics, type StereoMetrics } from '../stereoMetrics'
 import type { Envelope } from './motion'
 import { createSpatialGraph, loadMotionWorklet } from './spatialGraph'
+import { dbToGain } from './nodeUtils'
 import { loadTailWorklet } from './tailEngine'
 import { isMotionActive, isTailActive, wideSideCapDb, type ActiveSpatialMode, type SpatialParams } from './spatialSpec'
 
@@ -39,7 +43,12 @@ export function buildSpatialExcerpt(buffer: AudioBuffer): AudioBuffer {
   return out
 }
 
-async function render(excerpt: AudioBuffer, build?: (ctx: OfflineAudioContext, src: AudioNode) => Promise<AudioNode>): Promise<Float32Array[]> {
+async function render(
+  excerpt: AudioBuffer,
+  build?: (ctx: OfflineAudioContext, src: AudioNode) => Promise<AudioNode>,
+  worklet = false,
+): Promise<Float32Array[]> {
+  countAnalysisRender(worklet)
   // 残響の余韻を含めるため 1 秒長くレンダリングする
   const ctx = new OfflineAudioContext(2, excerpt.length + excerpt.sampleRate, excerpt.sampleRate)
   const src = new AudioBufferSourceNode(ctx, { buffer: excerpt })
@@ -74,6 +83,11 @@ export interface SpatialPlanOptions {
   hrtfLatencySeconds: number
   /** PULSE 用の包絡（Motion ON 時） */
   envelope?: Envelope | null
+  /**
+   * 重低音段（ON のとき）。空間段の前に同じ処理を通してから測り、チェーン全体（重低音 + 空間）が原音と同じ
+   * ラウドネスになるトリムを決める（重低音段がピークの予算のために全帯域を下げた分も、空間段のリミッター予算内で戻す）
+   */
+  bass?: { params: BassParams; scale: number; dynamics: DynamicsSettings }
 }
 
 async function renderSpatial(
@@ -86,8 +100,8 @@ async function renderSpatial(
 ) {
   return render(excerpt, async (ctx, src) => {
     if (opts.useWorklet && !(await loadDynamicsWorklet(ctx))) throw new Error('解析用 AudioWorklet を読み込めませんでした')
-    // Motion ON なら Motion チェーンだけを作る（抜粋の先頭をメディア時刻 0 として動きを再現）。
-    // Spatial Tail ON のときは残響が音量に効くため、モードのチェーン（反射音・Tail）も作る
+    // 抜粋の先頭をメディア時刻 0 として Motion の動きを再現する。Motion ON でも反射音（モードのチェーン）は
+    // 出力に含まれるため、モードのチェーンも作る（Phase 05 で修正: 以前は Tail OFF のとき作らず、反射音の分だけ音量を低く見積もっていた）
     const motion = isMotionActive(params) && (await loadMotionWorklet(ctx))
     const tail = isTailActive(params)
     if (tail && opts.useWorklet) await loadTailWorklet(ctx)
@@ -97,20 +111,30 @@ async function renderSpatial(
       trimDb,
       useWorklet: opts.useWorklet,
       hrtfLatencySeconds: opts.hrtfLatencySeconds,
-      modes: motion && !tail ? [] : [params.mode],
+      modes: [params.mode],
       limiterEnabled,
       wideSideCapDb,
       motion: motion ? { envelope: opts.envelope ?? null } : undefined,
     })
-    src.connect(g.input)
+    if (opts.bass) {
+      const b = createProcessingGraph(ctx, { params: opts.bass.params, scale: opts.bass.scale, bypass: false, dynamics: { ...opts.bass.dynamics, reportIntervalMs: 0 }, useWorklet: opts.useWorklet })
+      src.connect(b.input)
+      b.output.connect(g.input)
+    } else src.connect(g.input)
     return g.output
-  })
+  }, opts.useWorklet)
 }
 
 /**
  * 実際の空間処理グラフで抜粋をレンダリングし、原音とラウドネスが一致するトリム量を決める。
  * （空間処理で「大きい方が良く聞こえる」錯覚を避けるため、A/B 比較は同じラウドネスで行う）
  * 持ち上げ方向はリミッター GR 予算 3 dB 以内、AudioWorklet が使えない環境では下げる方向のみ。
+ *
+ * 解析用の OfflineAudioContext を減らす（Chrome は AudioWorklet を読み込んだ文脈を解放しないため）:
+ * - 1 回目（トリム 0・リミッターなし）は、Motion・Spatial Tail を使わない設定なら AudioWorklet なしで作る
+ *   （出力段のワークレットはトリム 0・リミッター OFF では素通しなので、ゲイン 1 の経路と同じ値）
+ * - 2 回目（トリム・リミッター込み）は、トリム後のピークが天井を超える（リミッターが働く）ときだけ実際にレンダリングし、
+ *   超えない場合は 1 回目の出力にトリムのゲインを掛けたものを使う（リミッターが働かなければ同じ値）
  */
 export async function planSpatial(excerpt: AudioBuffer, before: StereoMetrics, params: SpatialParams, opts: SpatialPlanOptions): Promise<SpatialPlan> {
   if (params.mode === 'off' || !Number.isFinite(before.loudnessLufs)) {
@@ -118,12 +142,15 @@ export async function planSpatial(excerpt: AudioBuffer, before: StereoMetrics, p
   }
   const p = { ...params, mode: params.mode }
   const cap = wideCapFor(before)
-  const probe = await renderSpatial(excerpt, p, 0, false, opts, cap)
+  const needsWorklet = opts.useWorklet && (isMotionActive(p) || isTailActive(p) || !!opts.bass)
+  const probe = await renderSpatial(excerpt, p, 0, false, { ...opts, useWorklet: needsWorklet }, cap)
   const probeLufs = integratedLoudness(probe, excerpt.sampleRate)
   const peak999 = blockPeakPercentileDb(probe, excerpt.sampleRate, 0.999)
   let trimDb = Math.min(Math.max(before.loudnessLufs - probeLufs, TRIM_MIN_DB), opts.useWorklet ? TRIM_MAX_DB : 0)
   if (peak999 + trimDb > CEILING_DB + LIMITER_BUDGET_DB) trimDb = Math.min(trimDb, CEILING_DB + LIMITER_BUDGET_DB - peak999)
-  const final = await renderSpatial(excerpt, p, trimDb, true, opts, cap)
+  const g = dbToGain(trimDb)
+  const limiterIdle = samplePeak(probe) * g <= dbToGain(CEILING_DB)
+  const final = limiterIdle ? probe.map((x) => Float32Array.from(x, (v) => v * g)) : await renderSpatial(excerpt, p, trimDb, true, opts, cap)
   const after = stereoMetrics(final, excerpt.sampleRate)
   return {
     params,

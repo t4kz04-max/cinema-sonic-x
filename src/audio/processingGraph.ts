@@ -1,4 +1,5 @@
 import { CROSSOVER_HZ, FALLBACK_COMPRESSOR_SPEC, MODE_SPECS, paramsToGains, type BassParams } from './bassSpec'
+import { createAlignDelay } from './alignDelay'
 import { clearRamp, linearRampAt } from './spatial/nodeUtils'
 import type { DynamicsMeter, DynamicsSettings } from './dynamicsTypes'
 import workletUrl from './worklets/bassDynamics.worklet.ts?worker&url'
@@ -161,17 +162,22 @@ export interface GraphOptions {
   bypass: boolean
   dynamics: DynamicsSettings
   useWorklet: boolean
+  /**
+   * ORIGINAL/PROCESSED 比較の時刻合わせ: dry 経路をリミッターの先読み分だけ遅らせる（整数サンプル、原音とビット一致のまま）。
+   * 事前に loadAlignWorklet が必要。省略時は遅らせない（dry = 入力と同時刻でビット一致）
+   */
+  alignBypass?: boolean
 }
 
 /**
  * 処理グラフ:
  *
- *   input ─┬─ dry ─────────────────────────────────────────────────────────────────┬─ output
+ *   input ─┬─ [時刻合わせ] ─ dry ───────────────────────────────────────────────────┬─ output
  *          └─ EQ ─┬─ LR4 LP ─→ [worklet in0: 低域コンプ] ┐                            │
  *                 └─ LR4 HP ─→ [worklet in1]            ┴→ 合成 → トリム → リミッター → wet ┘
  *
  * フォールバック（AudioWorklet 非対応）: EQ → トリム → DynamicsCompressor → メイクアップ打消し → wet
- * BYPASS 時は dry=1 / wet=0。dry 経路はゲイン 1 のみなので原音とビット一致する。
+ * BYPASS 時は dry=1 / wet=0。dry 経路はゲイン 1（と整数サンプルの遅延）のみなので原音とビット一致する。
  */
 export function createProcessingGraph(ctx: BaseAudioContext, opts: GraphOptions): ProcessingGraph {
   const input = new GainNode(ctx)
@@ -179,7 +185,11 @@ export function createProcessingGraph(ctx: BaseAudioContext, opts: GraphOptions)
   const dry = new GainNode(ctx, { gain: opts.bypass ? 1 : 0 })
   const wet = new GainNode(ctx, { gain: opts.bypass ? 0 : 1 })
   const eq = createEqChain(ctx, opts.params, opts.scale)
-  input.connect(dry).connect(output)
+  // 時刻合わせはワークレット経路（先読みの遅延が整数サンプル）のときだけ
+  const align = opts.alignBypass && opts.useWorklet ? createAlignDelay(ctx, opts.dynamics.lookaheadMs / 1000) : null
+  if (align) input.connect(align.node).connect(dry)
+  else input.connect(dry)
+  dry.connect(output)
   input.connect(eq.input)
 
   let worklet: AudioWorkletNode | null = null

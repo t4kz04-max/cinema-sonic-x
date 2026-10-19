@@ -40,12 +40,17 @@ src/
     spatial/tail*.ts   Spatial Tail（tailImpulse: 余韻の IR 合成 / tailEngine: 後期残響チェーン / tailTypes）、reverbBus.ts: 畳み込みの切替・残響の消去
     worklets/tail.worklet.ts    Dynamic Tail・残響の蓄積防止
     transportOps.ts    STOP / PAUSE / CUT / ループ境界の操作（再生エンジンとテストで共通）
+    presets/spatialPresets.ts  Phase 05 の完成版プリセット（凍結した型付き設定、presetToDsp で DspConfig に写す）
+    dspConfig.ts       再生エンジン・書き出しが受け取る DSP 設定一式（重低音 + 空間）、比較・検証・解析キャッシュのキー
+    outputChain.ts     重低音グラフ → 空間グラフのチェーン構築（再生・オフラインで共通）
+    alignDelay.ts / worklets/align.worklet.ts  ORIGINAL/PROCESSED 比較の時刻合わせ（整数サンプル遅延）
+    planCache.ts / analysisStats.ts  処理計画のキャッシュ・解析用文脈の作成回数
     loopRegion.ts      ループ区間（SPATIAL LOOP は音楽が鳴っている区間）
     stereoMetrics.ts   位相相関・ステレオ幅・モノラル和の測定（純粋関数）
   dev/         DSP 自己診断（tests/dsp-selftest.html から実行。本番ビルドに含まれない）
   hooks/       React と audio 層の橋渡し（useAudioPlayer）
   components/  表示とユーザー操作のみ。音声ノードを直接触らない
-  utils/       純粋関数（ヘッダー解析・フォーマット・検証）
+  utils/       純粋関数（ヘッダー解析・フォーマット・検証）、customPresetStorage（CUSTOM のブラウザ内保存）
   types/       共有型
 docs/PHASES.md 開発計画
 ```
@@ -56,7 +61,7 @@ docs/PHASES.md 開発計画
 - リミッターは先読み付きのサンプルピークリミッター。True Peak とは表記しない。
 - Phase 03 の倍音生成は EQ の後・クロスオーバーの前に挿入し、処理計画（analysis.ts の planProcessing）の計測にも含める。
 - 音量Gainは常に最終段（モニター音量）であり、書き出し音声には影響させない。
-- 空間グラフは重低音グラフの後に直列。ORIGINAL/PROCESSED は両段を同時に BYPASS し、直列でも原音とビット一致させる。
+- 空間グラフは重低音グラフの後に直列（outputChain.ts）。ORIGINAL/PROCESSED は両段を同時に BYPASS し、直列でも原音とビット一致させる（再生エンジンでは時刻合わせの整数サンプル遅延だけ遅れた原音とビット一致）。
 - 空間処理は原音とラウドネスをそろえて A/B 比較させる。HRTF の前方定位は個人差があるため、成立を前提にした表示・説明をしない。単純な左右パン・回転を「空間化」と呼ばない。
 - Motion の位置は必ず「メディア時刻とパラメーターの純粋関数」にする（乱数・壁時計を使わない）。シーク・オフライン書き出しで同じ動きを再現するため。HRTF の PannerNode は固定方向で使い、位置の自動化をしない。
 - 使っていないチェーンは入力を切り離し、休止できるワークレットは休止させる（CPU 負荷対策）。
@@ -65,6 +70,12 @@ docs/PHASES.md 開発計画
 - ワークレットの port.onmessage は通知を使うとき（reportIntervalMs > 0）だけ設定する（設定すると OfflineAudioContext ごと解放されない）。
 - ConvolverNode を作り直さない（ループ境界などで繰り返し作るとカーネルのメモリが積み上がる）。残響の消去は ReverbBus.reset で組を使い回す。
 - STOP は余韻を残し、PAUSE / CUT は余韻ごと止める。停止系の操作は transportOps.ts の関数を使い、テストも同じ関数で検証する。
+- プリセットの元データ（SPATIAL_PRESETS）は凍結してあり書き換えない。適用は presetToDsp のコピーを AudioEngine.applyDsp に渡す。詳細設定を変えた状態は CUSTOM（UI の状態。DSP 設定とは分けて持つ）。プリセットの設定値を変えたら version を上げる。
+- プリセットに HALL + Motion を使わない（ピーク対ラウドネス比が約 4 dB 上がり、リミッター予算内で原音のラウドネスにそろわない。Phase 05 で測定）。新しいプリセットは test:preset のラウドネス（全チェーン ±1 LU）・ピークを満たすこと。
+- 空間の処理計画（ラウドネス合わせ）は、重低音 ON のとき重低音段を通した音で測り、チェーン全体を原音にそろえる。計画は設定のキー（dspConfig の spatialPlanKey / bassPlanKey）でキャッシュし、同じ設定では解析し直さない。
+- ORIGINAL 経路は時刻合わせ（alignBypass）で処理経路と同じ遅延にする。遅延の変更は ORIGINAL 経路が無音のときだけ行う（整数サンプルのワークレットなので遅延した原音とビット一致）。
+- 1 つの入力に 3 つ以上の出力を足し込まない（ブラウザが足す順序が毎回変わり、同じ設定でも出力がわずかに変わる）。多数の和は spatialGraph の sumTree（2 入力ずつの木）を使う。
+- HRTF の方向を変えるときは PannerNode の位置を自動化せず、固定方向の 2 つを crossfade する（spatialGraph の createHrtfVoice）。
 - Mid/Side 処理で Side に足す成分はモノラル和で消える形にする（モノラル互換性）。Side ゲインは原音の幅に応じて上限を設け、逆相が支配的にならないようにする。
 - DynamicsCompressorNode（フォールバック）は自動メイクアップゲインを持つため、必ず実測値で打ち消す。基本コンプを「リミッター」「True Peak Limiter」と表記しない。
 - AudioParam の変更は平滑化（setTargetAtTime / linearRamp）し、クリックノイズを出さない。BiquadFilter の lowpass/highpass の Q は dB 指定である点に注意。
@@ -88,6 +99,7 @@ docs/PHASES.md 開発計画
 
 - 変更後は必ず `npm run build`（型チェック + ビルド）を実行し、エラーがないことを確認する。
 - `npm run lint`（oxlint）で警告を確認する。
-- 空間処理を変更したら `npm run test:spatial`（空間音響＋Motion）と `npm run test:tail`（Phase 04）を実行する。各スイートは別々のヘッドレスブラウザで順に実行される（Chrome が解析用の OfflineAudioContext を解放しないため）。空きメモリが 400 MB 未満になると中断する（`CSX_MIN_FREE_MB` で変更）。メモリに余裕があるときに 1 つずつ実行する。個別実行: `node scripts/run-dsp-selftest.mjs --suite=<motion|tail|cpu|tailcpu|baseline> [--query=groups=26-32] [--log]`。
+- 空間処理を変更したら `npm run test:spatial`（空間音響＋Motion）と `npm run test:tail`（Phase 04）を実行する。各スイートは別々のヘッドレスブラウザで順に実行される（Chrome が解析用の OfflineAudioContext を解放しないため）。空きメモリが 400 MB 未満になると中断する（`CSX_MIN_FREE_MB` で変更）。メモリに余裕があるときに 1 つずつ実行する。個別実行: `node scripts/run-dsp-selftest.mjs --suite=<motion|tail|cpu|tailcpu|baseline|preset|presetcpu> [--query=groups=26-32] [--log]`。
+- プリセット・A/B 比較・CUSTOM・解析の最適化を変更したら `npm run test:preset`（Phase 05、13 のブラウザセッションに分けて順に実行）を実行する。INFO 行は合否を判定しない測定値（原因調査など）。
 - 音声処理を変更したら `npm run test:dsp`（ヘッドレス Chrome/Edge で DSP 自己診断）を実行する。既知の FAIL（EDM相当の低域絶対値、docs/PHASES.md 参照）以外が出ないことを確認する。検証項目は `src/dev/dspSelfTest.ts` に追加し、純音だけでなく楽曲相当信号（`src/dev/testSignals.ts`）でも確認する。合格基準を結果に合わせて緩めない。
 - 実装できていない機能は報告で「未実装」と明示する。動作確認していないことを「動作する」と書かない。

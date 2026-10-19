@@ -1,9 +1,14 @@
 import type { DspMeters, DspStatus, PlaybackStatus } from '../types/audio'
-import { analyzeSource, bassThresholdFor, buildAnalysisExcerpt, planProcessing, type SourceAnalysis } from './analysis'
+import { analyzeSource, bassThresholdFor, buildAnalysisExcerpt, planProcessing, type ProcessingPlan, type SourceAnalysis } from './analysis'
+import { loadAlignWorklet } from './alignDelay'
+import { analysisStats } from './analysisStats'
 import { DEFAULT_BASS_PARAMS, type BassParams } from './bassSpec'
+import { bassPlanKey, cloneDsp, spatialPlanKey, type DspConfig } from './dspConfig'
+import { bassBypassed, createOutputChain, spatialBypassed } from './outputChain'
+import { PlanCache } from './planCache'
 import { eqCapScale } from './biquadMath'
 import { linearToDb } from './loudness'
-import { analyzeSpatialSource, buildSpatialExcerpt, planSpatial, wideCapFor } from './spatial/spatialAnalysis'
+import { analyzeSpatialSource, buildSpatialExcerpt, planSpatial, wideCapFor, type SpatialPlan, type SpatialPlanOptions } from './spatial/spatialAnalysis'
 import type { Envelope } from './spatial/motion'
 import { computeEnvelope } from './spatial/motionEnvelope'
 import { transportTime, type MotionReport, type MotionTransport } from './spatial/motionTypes'
@@ -21,16 +26,10 @@ import {
 import { loadTailWorklet } from './spatial/tailEngine'
 import type { TailReport } from './spatial/tailTypes'
 import { loopBounds, musicRegion, type LoopRegion, type LoopType } from './loopRegion'
-import { createSpatialGraph, loadMotionWorklet, measureHrtfLatency, type SpatialGraph } from './spatial/spatialGraph'
+import { loadMotionWorklet, measureHrtfLatency, type SpatialGraph } from './spatial/spatialGraph'
 import { DEFAULT_SPATIAL_PARAMS, type SpatialParams } from './spatial/spatialSpec'
 import type { StereoMetrics } from './stereoMetrics'
-import {
-  createProcessingGraph,
-  dynamicsSettingsFor,
-  loadDynamicsWorklet,
-  measureCompressorMakeup,
-  type ProcessingGraph,
-} from './processingGraph'
+import { dynamicsSettingsFor, loadDynamicsWorklet, measureCompressorMakeup, type ProcessingGraph } from './processingGraph'
 
 export class AudioContextUnavailableError extends Error {
   constructor(cause: unknown) {
@@ -57,6 +56,7 @@ const INITIAL_DSP_STATUS: DspStatus = {
   predictedLimiterGrDb: null,
   spectra: null,
   makeupCancelDb: null,
+  compare: { alignMs: null, analysis: { renders: 0, workletRenders: 0, cacheHits: 0 } },
   spatial: {
     analysis: 'idle',
     trimDb: 0,
@@ -81,6 +81,8 @@ const MOTION_REPORT_MS = 33
  * （数 MB）がメモリに残る（ブラウザの挙動。回数を減らして影響を抑える）
  */
 const PLAN_DEBOUNCE_MS = 250
+/** 同じ音源で覚えておく処理計画の数（設定ごと。プリセットを行き来しても解析し直さない） */
+const PLAN_CACHE_SIZE = 24
 /** ループ境界の何秒前に残響の消去を予約するか */
 const LOOP_ARM_AHEAD_SECONDS = 0.4
 /** 1 周がこれより短いループでは境界の残響消去をしない */
@@ -160,6 +162,13 @@ export class AudioEngine {
   private planDirty = false
   private planTimer: ReturnType<typeof setTimeout> | null = null
   private spatialPlanTimer: ReturnType<typeof setTimeout> | null = null
+  /** 同じ音源・同じ設定の処理計画（音源が変わると消す）。設定を戻したときに解析用の文脈を作り直さない */
+  private bassPlans = new PlanCache<ProcessingPlan>(PLAN_CACHE_SIZE)
+  private spatialPlans = new PlanCache<SpatialPlan>(PLAN_CACHE_SIZE)
+  /** 直近に適用した計画のキー（同じ設定での重複実行を防ぐ） */
+  private appliedBassKey: string | null = null
+  private appliedSpatialKey: string | null = null
+  private cacheHits = 0
 
   constructor(initialVolume: number) {
     this.volume = initialVolume
@@ -198,34 +207,36 @@ export class AudioEngine {
     }
     const gain = new GainNode(ctx, { gain: this.volume })
     gain.connect(ctx.destination)
-    const scale = eqCapScale(this.params) * this.safetyScale
-    const graph = createProcessingGraph(ctx, {
-      params: this.params,
-      scale,
-      bypass: this.bassBypassed(),
-      dynamics: dynamicsSettingsFor(this.params.mode, bassThresholdFor(this.params, this.sourceAnalysis), this.dsp.trimDb, {
+
+    this.hrtfLatency = await measureHrtfLatency(ctx.sampleRate)
+    const motionOk = await loadMotionWorklet(ctx)
+    if (this.useWorklet) await loadTailWorklet(ctx)
+    // ORIGINAL/PROCESSED の時刻合わせ（読み込めなければ合わせない = 従来どおり）
+    const align = this.useWorklet && (await loadAlignWorklet(ctx))
+    const chain = createOutputChain(ctx, {
+      dsp: this.dspConfig(),
+      bypass: this.bypass,
+      useWorklet: this.useWorklet,
+      bassScale: eqCapScale(this.params) * this.safetyScale,
+      bassDynamics: dynamicsSettingsFor(this.params.mode, bassThresholdFor(this.params, this.sourceAnalysis), this.dsp.trimDb, {
         reportIntervalMs: METER_INTERVAL_MS,
       }),
-      useWorklet: this.useWorklet,
+      spatial: {
+        trimDb: this.dsp.spatial.trimDb,
+        hrtfLatencySeconds: this.hrtfLatency,
+        wideSideCapDb: wideCapFor(this.spatialBefore),
+        reportIntervalMs: METER_INTERVAL_MS,
+        motion: motionOk ? { transport: this.transport(), envelope: this.envelope, reportIntervalMs: MOTION_REPORT_MS } : undefined,
+      },
+      alignBypass: align,
     })
+    const graph = chain.bass
+    const spatial = chain.spatial
     graph.setMakeupCancel(this.makeupCancel, false)
     graph.onMeter((m) => {
       this.meters = { ...this.meters, bassGrDb: m.bassGrDb, limiterGrDb: m.limiterGrDb }
     })
 
-    this.hrtfLatency = await measureHrtfLatency(ctx.sampleRate)
-    const motionOk = await loadMotionWorklet(ctx)
-    if (this.useWorklet) await loadTailWorklet(ctx)
-    const spatial = createSpatialGraph(ctx, {
-      params: this.spatialParams,
-      bypass: this.spatialBypassed(),
-      trimDb: this.dsp.spatial.trimDb,
-      useWorklet: this.useWorklet,
-      hrtfLatencySeconds: this.hrtfLatency,
-      wideSideCapDb: wideCapFor(this.spatialBefore),
-      reportIntervalMs: METER_INTERVAL_MS,
-      motion: motionOk ? { transport: this.transport(), envelope: this.envelope, reportIntervalMs: MOTION_REPORT_MS } : undefined,
-    })
     spatial.onMotionReport((r) => {
       this.motionReport = r
     })
@@ -235,7 +246,6 @@ export class AudioEngine {
     spatial.onTailReport((r) => {
       this.tailReport = r
     })
-    graph.output.connect(spatial.input)
     const outputGate = new GainNode(ctx, { gain: 1 })
     spatial.output.connect(outputGate).connect(gain)
     this.outputGate = outputGate
@@ -255,6 +265,7 @@ export class AudioEngine {
     this.scope = { left, right }
     this.updateDsp({
       dynamicsEngine: graph.engine,
+      compare: { ...this.dsp.compare, alignMs: this.compareAlignMs() },
       spatial: {
         ...this.dsp.spatial,
         hrtfLatencyMs: this.hrtfLatency * 1000,
@@ -421,6 +432,31 @@ export class AudioEngine {
   setBassEnabled(enabled: boolean): void {
     this.bassEnabled = enabled
     this.applyBypass()
+    // 重低音 OFF の間は計画を立てない（ON にしたとき、同じ設定ならキャッシュから即座に反映）
+    if (enabled) this.requestPlan()
+    // 空間段のトリムは重低音段の ON/OFF で変わる
+    this.requestSpatialPlan()
+  }
+
+  /** DSP 設定一式（プリセット・保存した CUSTOM）をまとめて適用する。解析の要求は各段 1 回だけ */
+  applyDsp(config: DspConfig): void {
+    const c = cloneDsp(config)
+    this.bassEnabled = c.bassEnabled
+    this.setBassParams(c.bass)
+    this.setSpatialParams(c.spatial)
+    this.applyBypass()
+  }
+
+  /** 現在の DSP 設定（書き出し・テスト用のコピー） */
+  dspConfig(): DspConfig {
+    return cloneDsp({ spatial: this.spatialParams, bass: this.params, bassEnabled: this.bassEnabled })
+  }
+
+  /** ORIGINAL 経路の時刻合わせ（ms、重低音段 + 空間段）。時刻合わせなしなら null */
+  private compareAlignMs(): number | null {
+    const s = this.spatialGraph?.bypassAlignSeconds()
+    if (s === null || s === undefined || !this.graph) return null
+    return (s + this.graph.latencySeconds) * 1000
   }
 
   setSpatialParams(params: SpatialParams): void {
@@ -432,6 +468,12 @@ export class AudioEngine {
     this.spatialGraph?.setParams(this.spatialParams, true)
     if (modeChanged) this.applyBypass()
     this.requestSpatialPlan()
+    this.refreshAlign()
+  }
+
+  /** 時刻合わせの値は bypassDry が無音になってから変わるため、フェード後に表示を更新する */
+  private refreshAlign(): void {
+    setTimeout(() => this.updateDsp({ compare: { ...this.dsp.compare, alignMs: this.compareAlignMs() } }), 150)
   }
 
   /** Motion Engine が実際に使っている位置（直近のレポート）。Motion OFF・未初期化なら null */
@@ -507,17 +549,11 @@ export class AudioEngine {
     return true
   }
 
-  private bassBypassed(): boolean {
-    return this.bypass || !this.bassEnabled
-  }
-
-  private spatialBypassed(): boolean {
-    return this.bypass || this.spatialParams.mode === 'off'
-  }
-
   private applyBypass(): void {
-    this.graph?.setBypass(this.bassBypassed(), true)
-    this.spatialGraph?.setBypass(this.spatialBypassed(), true)
+    const c = { spatial: this.spatialParams, bass: this.params, bassEnabled: this.bassEnabled }
+    this.graph?.setBypass(bassBypassed(c, this.bypass), true)
+    this.spatialGraph?.setBypass(spatialBypassed(c, this.bypass), true)
+    this.refreshAlign()
   }
 
   /** ワークレットが報告する直近のゲインリダクション（dB, 正の値） */
@@ -550,6 +586,10 @@ export class AudioEngine {
     const token = ++this.analysisToken
     this.excerpt = null
     this.sourceAnalysis = null
+    this.bassPlans.clear()
+    this.spatialPlans.clear()
+    this.appliedBassKey = null
+    this.appliedSpatialKey = null
     this.spatialExcerpt = null
     this.spatialBefore = null
     void this.startSpatialAnalysis(buffer, token)
@@ -572,6 +612,22 @@ export class AudioEngine {
    * 全帯域トリム・安全制限・低域コンプしきい値は計測完了まで直前の値を保つ。
    */
   private requestPlan(): void {
+    const key = bassPlanKey(this.params)
+    if (!this.bassEnabled) {
+      if (this.excerpt && key !== this.appliedBassKey && !this.planning) this.updateDsp({ analysis: 'standby' })
+      return
+    }
+    if (key === this.appliedBassKey && !this.planning) return
+    // 同じ音源・同じ設定の計画があれば、解析せずにすぐ反映する
+    const cached = this.excerpt && this.sourceAnalysis ? this.bassPlans.get(key) : undefined
+    if (cached && !this.planning) {
+      if (this.planTimer) clearTimeout(this.planTimer)
+      this.planTimer = null
+      this.planDirty = false
+      this.cacheHits++
+      this.applyBassPlan(cached, this.sourceAnalysis!)
+      return
+    }
     this.planDirty = true
     if (this.planTimer) clearTimeout(this.planTimer)
     this.planTimer = setTimeout(() => {
@@ -589,8 +645,15 @@ export class AudioEngine {
         const excerpt = this.excerpt
         const source = this.sourceAnalysis
         if (!excerpt || !source) return
-        this.updateDsp({ analysis: 'measuring' })
         const params = { ...this.params }
+        // 待っている間に、計画済みの設定へ戻した場合は解析しない
+        const cached = this.bassPlans.get(bassPlanKey(params))
+        if (cached) {
+          this.cacheHits++
+          this.applyBassPlan(cached, source)
+          continue
+        }
+        this.updateDsp({ analysis: 'measuring' })
         let plan
         try {
           plan = await planProcessing(excerpt, source, params, {
@@ -601,26 +664,41 @@ export class AudioEngine {
           if (token === this.analysisToken) this.updateDsp({ analysis: 'error' })
           continue
         }
-        if (token !== this.analysisToken || this.planDirty) continue
-        this.safetyScale = plan.safetyScale
-        this.graph?.setParams(params, plan.scale, true)
-        this.graph?.setDynamics({ ...plan.dynamics, reportIntervalMs: METER_INTERVAL_MS })
-        this.updateDsp({
-          analysis: plan.result ? 'ready' : 'silent',
-          trimDb: plan.trim.trimDb,
-          trimReason: plan.trim.reason,
-          capScale: plan.capScale,
-          safetyScale: plan.safetyScale,
-          bassThresholdDb: source.silent ? null : plan.dynamics.bassThresholdDb,
-          loudnessDeltaLu: plan.result?.loudnessDeltaLu ?? null,
-          outputPeakDb: plan.result?.outputPeakDb ?? null,
-          predictedLimiterGrDb: plan.result?.predictedLimiterGrDb ?? null,
-          spectra: plan.result ? { before: source.spectrum, after: plan.result.spectrum } : null,
-        })
+        if (token !== this.analysisToken) continue
+        this.bassPlans.set(bassPlanKey(params), plan)
+        if (this.planDirty) continue
+        this.applyBassPlan(plan, source)
       }
     } finally {
       this.planning = false
     }
+  }
+
+  private applyBassPlan(plan: ProcessingPlan, source: SourceAnalysis): void {
+    const params = plan.params
+    // 空間段のトリムは重低音段の結果に依存する
+    queueMicrotask(() => this.requestSpatialPlan())
+    this.appliedBassKey = bassPlanKey(params)
+    this.safetyScale = plan.safetyScale
+    this.graph?.setParams(params, plan.scale, true)
+    this.graph?.setDynamics({ ...plan.dynamics, reportIntervalMs: METER_INTERVAL_MS })
+    this.updateDsp({
+      compare: { ...this.dsp.compare, analysis: this.analysisSummary() },
+      analysis: plan.result ? 'ready' : 'silent',
+      trimDb: plan.trim.trimDb,
+      trimReason: plan.trim.reason,
+      capScale: plan.capScale,
+      safetyScale: plan.safetyScale,
+      bassThresholdDb: source.silent ? null : plan.dynamics.bassThresholdDb,
+      loudnessDeltaLu: plan.result?.loudnessDeltaLu ?? null,
+      outputPeakDb: plan.result?.outputPeakDb ?? null,
+      predictedLimiterGrDb: plan.result?.predictedLimiterGrDb ?? null,
+      spectra: plan.result ? { before: source.spectrum, after: plan.result.spectrum } : null,
+    })
+  }
+
+  private analysisSummary() {
+    return { renders: analysisStats.renders, workletRenders: analysisStats.workletRenders, cacheHits: this.cacheHits }
   }
 
   private async startSpatialAnalysis(buffer: AudioBuffer, token: number): Promise<void> {
@@ -641,7 +719,30 @@ export class AudioEngine {
     }
   }
 
+  /**
+   * 空間の処理計画のキー。重低音 ON のときは重低音段の設定も含む（空間段のトリムはチェーン全体のラウドネスで決めるため）
+   */
+  private spatialKey(params: SpatialParams = this.spatialParams): string {
+    return spatialPlanKey(params) + (this.bassActiveForPlan() ? `|bass:${bassPlanKey(this.params)}` : '')
+  }
+
+  /** 空間の計画で重低音段を含めるか（AudioWorklet が使えない環境では含めない = 従来どおり空間段だけで合わせる） */
+  private bassActiveForPlan(): boolean {
+    return this.bassEnabled && this.useWorklet && this.spatialParams.mode !== 'off'
+  }
+
   private requestSpatialPlan(): void {
+    const key = this.spatialKey()
+    if (key === this.appliedSpatialKey && !this.spatialPlanning) return
+    const cached = this.spatialExcerpt && this.spatialBefore ? this.spatialPlans.get(key) : undefined
+    if (cached && !this.spatialPlanning) {
+      if (this.spatialPlanTimer) clearTimeout(this.spatialPlanTimer)
+      this.spatialPlanTimer = null
+      this.spatialDirty = false
+      this.cacheHits++
+      this.applySpatialPlan(cached, key)
+      return
+    }
     this.spatialDirty = true
     if (this.spatialPlanTimer) clearTimeout(this.spatialPlanTimer)
     this.spatialPlanTimer = setTimeout(() => {
@@ -660,9 +761,28 @@ export class AudioEngine {
         const before = this.spatialBefore
         if (!excerpt || !before) return
         const params = { ...this.spatialParams }
+        const key = this.spatialKey(params)
+        const cached = this.spatialPlans.get(key)
+        if (cached) {
+          this.cacheHits++
+          this.applySpatialPlan(cached, key)
+          continue
+        }
         if (params.mode === 'off') {
+          this.appliedSpatialKey = key
           this.updateSpatial({ analysis: 'ready', after: null, monoColorationDb: null, stereoColorationDb: null, predictedLimiterGrDb: null })
           continue
+        }
+        // 重低音 ON: 現在の重低音の計画ができてから（計画が出たときに requestSpatialPlan し直す）
+        let bass: SpatialPlanOptions['bass']
+        if (this.bassActiveForPlan()) {
+          const bp = this.bassPlans.get(bassPlanKey(this.params))
+          if (!bp) {
+            this.updateSpatial({ analysis: 'measuring' })
+            this.requestPlan()
+            break
+          }
+          bass = { params: bp.params, scale: bp.scale, dynamics: bp.dynamics }
         }
         this.updateSpatial({ analysis: 'measuring' })
         let plan
@@ -671,26 +791,35 @@ export class AudioEngine {
             useWorklet: this.useWorklet,
             hrtfLatencySeconds: this.hrtfLatency,
             envelope: this.envelope,
+            bass,
           })
         } catch {
           if (token === this.analysisToken) this.updateSpatial({ analysis: 'error' })
           continue
         }
-        if (token !== this.analysisToken || this.spatialDirty) continue
-        this.spatialGraph?.setTrimDb(plan.trimDb)
-        this.updateSpatial({
-          analysis: plan.after ? 'ready' : 'silent',
-          trimDb: plan.trimDb,
-          wideSideCapDb: plan.wideSideCapDb,
-          after: plan.after,
-          monoColorationDb: plan.monoColorationDb,
-          stereoColorationDb: plan.stereoColorationDb,
-          predictedLimiterGrDb: plan.predictedLimiterGrDb,
-        })
+        if (token !== this.analysisToken) continue
+        this.spatialPlans.set(key, plan)
+        if (this.spatialDirty) continue
+        this.applySpatialPlan(plan, key)
       }
     } finally {
       this.spatialPlanning = false
     }
+  }
+
+  private applySpatialPlan(plan: SpatialPlan, key: string): void {
+    this.appliedSpatialKey = key
+    this.spatialGraph?.setTrimDb(plan.trimDb)
+    this.updateDsp({ compare: { ...this.dsp.compare, analysis: this.analysisSummary() } })
+    this.updateSpatial({
+      analysis: plan.after ? 'ready' : 'silent',
+      trimDb: plan.trimDb,
+      wideSideCapDb: plan.wideSideCapDb,
+      after: plan.after,
+      monoColorationDb: plan.monoColorationDb,
+      stereoColorationDb: plan.stereoColorationDb,
+      predictedLimiterGrDb: plan.predictedLimiterGrDb,
+    })
   }
 
   private updateSpatial(patch: Partial<DspStatus['spatial']>): void {
