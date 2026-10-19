@@ -37,6 +37,10 @@ src/
     spatial/           空間音響（spatialSpec: モード定義・説明 / spatialGraph: WIDE・CINEMA・HALL / spatialAnalysis: ラウドネス合わせと測定 / hallImpulse: 残響 IR 合成）
     spatial/motion*.ts Dynamic Spatial Motion Engine（motion: 位置の純粋関数 / motionEnvelope: PULSE 包絡 / motionTypes）
     worklets/motion.worklet.ts  STFT レイヤー分解・距離処理・12 方向パン
+    spatial/tail*.ts   Spatial Tail（tailImpulse: 余韻の IR 合成 / tailEngine: 後期残響チェーン / tailTypes）、reverbBus.ts: 畳み込みの切替・残響の消去
+    worklets/tail.worklet.ts    Dynamic Tail・残響の蓄積防止
+    transportOps.ts    STOP / PAUSE / CUT / ループ境界の操作（再生エンジンとテストで共通）
+    loopRegion.ts      ループ区間（SPATIAL LOOP は音楽が鳴っている区間）
     stereoMetrics.ts   位相相関・ステレオ幅・モノラル和の測定（純粋関数）
   dev/         DSP 自己診断（tests/dsp-selftest.html から実行。本番ビルドに含まれない）
   hooks/       React と audio 層の橋渡し（useAudioPlayer）
@@ -56,6 +60,11 @@ docs/PHASES.md 開発計画
 - 空間処理は原音とラウドネスをそろえて A/B 比較させる。HRTF の前方定位は個人差があるため、成立を前提にした表示・説明をしない。単純な左右パン・回転を「空間化」と呼ばない。
 - Motion の位置は必ず「メディア時刻とパラメーターの純粋関数」にする（乱数・壁時計を使わない）。シーク・オフライン書き出しで同じ動きを再現するため。HRTF の PannerNode は固定方向で使い、位置の自動化をしない。
 - 使っていないチェーンは入力を切り離し、休止できるワークレットは休止させる（CPU 負荷対策）。
+- 既存 HALL の余韻は変えない。Spatial Tail OFF・NATURAL 50/50 がベースライン（src/dev/hallBaseline.json）と一致することを test:tail で確認する。
+- AudioParam のランプは nodeUtils の linearRampAt / fadeGate / rampLinear を使う（linearRampToValueAtTime を直接使うと、前のイベントが過去にあるときランプが過去から始まり値が飛ぶ）。
+- ワークレットの port.onmessage は通知を使うとき（reportIntervalMs > 0）だけ設定する（設定すると OfflineAudioContext ごと解放されない）。
+- ConvolverNode を作り直さない（ループ境界などで繰り返し作るとカーネルのメモリが積み上がる）。残響の消去は ReverbBus.reset で組を使い回す。
+- STOP は余韻を残し、PAUSE / CUT は余韻ごと止める。停止系の操作は transportOps.ts の関数を使い、テストも同じ関数で検証する。
 - Mid/Side 処理で Side に足す成分はモノラル和で消える形にする（モノラル互換性）。Side ゲインは原音の幅に応じて上限を設け、逆相が支配的にならないようにする。
 - DynamicsCompressorNode（フォールバック）は自動メイクアップゲインを持つため、必ず実測値で打ち消す。基本コンプを「リミッター」「True Peak Limiter」と表記しない。
 - AudioParam の変更は平滑化（setTargetAtTime / linearRamp）し、クリックノイズを出さない。BiquadFilter の lowpass/highpass の Q は dB 指定である点に注意。
@@ -79,6 +88,6 @@ docs/PHASES.md 開発計画
 
 - 変更後は必ず `npm run build`（型チェック + ビルド）を実行し、エラーがないことを確認する。
 - `npm run lint`（oxlint）で警告を確認する。
-- 空間処理を変更したら `npm run test:spatial` を実行し、全 PASS を確認する（Motion を含めて 10 分前後かかる。Motion だけなら tests/dsp-selftest.html?suite=motion）。テストはヘッドレスブラウザを起動するため、メモリに余裕があるときに 1 つずつ実行する。
+- 空間処理を変更したら `npm run test:spatial`（空間音響＋Motion）と `npm run test:tail`（Phase 04）を実行する。各スイートは別々のヘッドレスブラウザで順に実行される（Chrome が解析用の OfflineAudioContext を解放しないため）。空きメモリが 400 MB 未満になると中断する（`CSX_MIN_FREE_MB` で変更）。メモリに余裕があるときに 1 つずつ実行する。個別実行: `node scripts/run-dsp-selftest.mjs --suite=<motion|tail|cpu|tailcpu|baseline> [--query=groups=26-32] [--log]`。
 - 音声処理を変更したら `npm run test:dsp`（ヘッドレス Chrome/Edge で DSP 自己診断）を実行する。既知の FAIL（EDM相当の低域絶対値、docs/PHASES.md 参照）以外が出ないことを確認する。検証項目は `src/dev/dspSelfTest.ts` に追加し、純音だけでなく楽曲相当信号（`src/dev/testSignals.ts`）でも確認する。合格基準を結果に合わせて緩めない。
 - 実装できていない機能は報告で「未実装」と明示する。動作確認していないことを「動作する」と書かない。

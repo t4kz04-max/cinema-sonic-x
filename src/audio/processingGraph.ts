@@ -1,4 +1,5 @@
 import { CROSSOVER_HZ, FALLBACK_COMPRESSOR_SPEC, MODE_SPECS, paramsToGains, type BassParams } from './bassSpec'
+import { clearRamp, linearRampAt } from './spatial/nodeUtils'
 import type { DynamicsMeter, DynamicsSettings } from './dynamicsTypes'
 import workletUrl from './worklets/bassDynamics.worklet.ts?worker&url'
 
@@ -202,7 +203,8 @@ export function createProcessingGraph(ctx: BaseAudioContext, opts: GraphOptions)
     xo.lowOut.connect(worklet, 0, 0)
     xo.highOut.connect(worklet, 0, 1)
     worklet.connect(wet).connect(output)
-    worklet.port.onmessage = (e: MessageEvent<DynamicsMeter>) => meterListener?.(e.data)
+    // 通知を使うときだけ受信する（onmessage を設定した MessagePort は閉じるまで GC されず、解析用の OfflineAudioContext ごと残るため）
+    if ((opts.dynamics.reportIntervalMs ?? 0) > 0) worklet.port.onmessage = (e: MessageEvent<DynamicsMeter>) => meterListener?.(e.data)
   } else {
     trim = new GainNode(ctx, { gain: dbToGain(opts.dynamics.trimDb) })
     const comp = new DynamicsCompressorNode(ctx, { ...FALLBACK_COMPRESSOR_SPEC })
@@ -236,12 +238,13 @@ export function createProcessingGraph(ctx: BaseAudioContext, opts: GraphOptions)
         if (!smooth) {
           node.gain.cancelScheduledValues(0)
           node.gain.value = target
+          clearRamp(node.gain)
           continue
         }
-        // 線形クロスフェードで終点が厳密に 0 / 1 になる（setTargetAtTime は漸近のみ）
+        // 線形クロスフェードで終点が厳密に 0 / 1 になる（setTargetAtTime は漸近のみ）。
+        // 開始点を明示する（2 回目以降の切替でランプが前回の終点から始まり、値が飛ぶのを防ぐ）
         const t = ctx.currentTime
-        holdAt(node.gain, t)
-        node.gain.linearRampToValueAtTime(target, t + BYPASS_FADE_SECONDS)
+        linearRampAt(node.gain, t, target, t + BYPASS_FADE_SECONDS)
       }
     },
     onMeter(listener) {

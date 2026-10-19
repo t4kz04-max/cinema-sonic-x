@@ -21,6 +21,7 @@ import type { SpatialStatus } from '../types/audio'
 import { Badge, Panel } from './Panel'
 import { RangeControl } from './RangeControl'
 import { SpatialVisualizer } from './SpatialVisualizer'
+import { TailBlock } from './TailBlock'
 import { Vectorscope } from './Vectorscope'
 
 interface SpatialPanelProps {
@@ -320,6 +321,8 @@ export function SpatialPanel({ player }: SpatialPanelProps) {
       </div>
 
       <MotionBlock player={player} />
+
+      <TailBlock player={player} />
 
       {doc && (
         <div className="spatial-doc">

@@ -2,6 +2,8 @@
 // 各モードで 4 つのパラメーターが何を変えるかを、UI に表示する説明文と一緒にここで定義する。
 
 import type { MotionControl, MotionLayout, MotionPreset } from './motion'
+import { rippleSpreadSeconds, type ActiveTailMode, type TailMode } from './tailImpulse'
+import { TAIL_DETECTOR, type TailDynamics } from './tailTypes'
 
 export type SpatialMode = 'off' | 'wide' | 'cinema' | 'hall'
 export type ActiveSpatialMode = Exclude<SpatialMode, 'off'>
@@ -21,6 +23,12 @@ export interface SpatialParams {
   motionSpeed: number
   motionDepth: number
   centerLock: number
+  /** Spatial Tail（CINEMA / HALL で有効）。OFF = 既存の動作 */
+  tailMode: TailMode
+  /** 以下 0〜100（50 = 現在の HALL と同じ残響時間・レベル） */
+  tailLength: number
+  tailIntensity: number
+  dynamicTail: boolean
 }
 
 export const DEFAULT_SPATIAL_PARAMS: SpatialParams = {
@@ -34,6 +42,10 @@ export const DEFAULT_SPATIAL_PARAMS: SpatialParams = {
   motionSpeed: 40,
   motionDepth: 60,
   centerLock: 80,
+  tailMode: 'off',
+  tailLength: 50,
+  tailIntensity: 50,
+  dynamicTail: false,
 }
 
 const u = (v: number) => Math.min(Math.max(v / 100, 0), 1)
@@ -327,7 +339,8 @@ export const MOTION_PROCESSING = [
   'CENTER と BED（低域）は前方・固定。LEFT / RIGHT / AMBIENCE だけがプリセットに従って独立に動く',
   '位置は再生時刻の関数（乱数なし）。シーク・一時停止・オフライン書き出しでも同じ動きを再現する',
   '各レイヤーに距離処理（逆距離ゲイン・空気吸収ローパス・伝搬遅延）を掛け、30° 間隔 12 方向の固定 HRTF 仮想スピーカーへ等パワーパンで配置（HRTF 自体は動かさないため切替ノイズが出ない）',
-  '反射音・残響は原音から作るため、距離が変わると直接音と残響の比率・到達時間差が変わる',
+  '初期反射（CINEMA の反射・HALL の初期反射）への送りは、LEFT / RIGHT レイヤーを現在の左右位置に振り分けて作る（反射音も音源の移動に追従。CENTER・AMBIENCE・BED は元のチャンネルのまま）。後期残響はモノラル送りのまま安定した空間として残す',
+  '反射音・残響への送りには距離処理を掛けないため、距離が変わると直接音と残響の比率・到達時間差が変わる',
 ]
 
 export const MOTION_CAVEATS = [
@@ -335,4 +348,89 @@ export const MOTION_CAVEATS = [
   'STFT 分解の遅延 約 43 ms（48 kHz）。ORIGINAL/PROCESSED 切替時にこの分だけ時間がずれる',
   'HALL でも Motion ON の直接音は HRTF で描画されるため、ヘッドホン再生が前提',
   'SPEED/プリセット変更時は位置が新しい軌道へ 0.15 秒の平滑化で移る',
+]
+
+// ---------------- SPATIAL TAIL ----------------
+
+export function tailSupported(mode: SpatialMode): mode is 'cinema' | 'hall' {
+  return mode === 'cinema' || mode === 'hall'
+}
+
+export function isTailActive(p: SpatialParams): boolean {
+  return p.tailMode !== 'off' && tailSupported(p.mode)
+}
+
+export interface TailSettings {
+  mode: ActiveTailMode
+  /** 残響時間（秒） */
+  rt60: number
+  preDelayMs: number
+  /** 残響の戻りのレベル（dB、IR はエネルギー 1 に正規化） */
+  gainDb: number
+}
+
+/** TAIL LENGTH: 残響時間の倍率 ½〜2 倍（50 で 1 倍） */
+export const tailLengthScale = (length: number) => Math.pow(2, (u(length) - 0.5) * 2)
+/** TAIL INTENSITY: ±12 dB（50 で 0 dB） */
+export const tailIntensityOffsetDb = (intensity: number) => (u(intensity) - 0.5) * 24
+export const TAIL_MAX_GAIN_DB = -2
+export const TAIL_RT60_RANGE: [number, number] = [0.4, 6]
+
+/**
+ * Spatial Tail の残響設定。基準は HALL の後期残響（ROOM SIZE → RT60・プリディレイ、INTENSITY → レベル）で、
+ * TAIL LENGTH / TAIL INTENSITY が 50 なら HALL と同じ値（NATURAL は既存 HALL の後期残響と一致する）
+ */
+export function tailSettings(p: SpatialParams): TailSettings {
+  const h = hallSettings(p)
+  return {
+    mode: p.tailMode === 'off' ? 'natural' : p.tailMode,
+    rt60: Math.min(Math.max(h.rt60 * tailLengthScale(p.tailLength), TAIL_RT60_RANGE[0]), TAIL_RT60_RANGE[1]),
+    preDelayMs: h.preDelayMs,
+    gainDb: Math.min(h.lateGainDb + tailIntensityOffsetDb(p.tailIntensity), TAIL_MAX_GAIN_DB),
+  }
+}
+
+/** Dynamic Tail の下げ幅（dB）と蓄積防止の余裕（dB） */
+export const DYNAMIC_TAIL_DUCK_DB = 8
+export const TAIL_GUARD_MARGIN_DB = 3
+
+export function tailDynamics(p: SpatialParams): TailDynamics {
+  return { dynamic: p.dynamicTail && isTailActive(p), duckDb: DYNAMIC_TAIL_DUCK_DB, guardMarginDb: TAIL_GUARD_MARGIN_DB }
+}
+
+export const TAIL_MODE_DOCS: Record<ActiveTailMode, { label: string; summary: string; detail: string }> = {
+  natural: {
+    label: 'NATURAL',
+    summary: '既存 HALL の余韻をそのまま基礎にした自然な残響',
+    detail: 'HALL と同じ合成 IR（左右無相関・高域ほど早く減衰）。TAIL LENGTH / INTENSITY が 50 なら既存 HALL の後期残響と同じ値になる',
+  },
+  distance: {
+    label: 'DISTANCE',
+    summary: '余韻が遠ざかりながら消える',
+    detail: '残響が時間とともに暗く（高域を NATURAL より速く失う）、狭く（左右の広がり 100% → 20%）なり、遠くの一点へ小さくなっていく。減衰の速さ（RT60）は NATURAL と同じ',
+  },
+  ripple: {
+    label: 'RIPPLE',
+    summary: '中央から波紋のように左右へ広がって溶ける（演出）',
+    detail: `残響を 4 つの空間レイヤー（中央・やや広い・広い・左右無相関）に分け、波面が中央から外側へ約 ${rippleSpreadSeconds(2).toFixed(1)} 秒（RT60 2 秒のとき）で進む。レイヤーは独立したノイズで干渉しない。自然な響きではなく演出的な処理`,
+  },
+}
+
+export const TAIL_PARAM_DOCS = {
+  tailLength: '残響時間の倍率 ½〜2 倍（50 = 現在の ROOM SIZE の HALL と同じ。0.4〜6 秒に制限）',
+  tailIntensity: '残響のレベル ±12 dB（50 = 現在の INTENSITY の HALL と同じ。上限 −2 dB）',
+  dynamicTail: `演奏が密な間は残響を最大 ${DYNAMIC_TAIL_DUCK_DB} dB 下げて直接音を明瞭に保ち、音の切れ目で設定レベルへ戻す（Attack ${TAIL_DETECTOR.attack * 1000} ms・Hold ${TAIL_DETECTOR.hold * 1000} ms・Release ${TAIL_DETECTOR.release * 1000} ms）。設定レベルより大きくはしない`,
+} as const
+
+export const TAIL_PROCESSING = [
+  'HALL の後期残響と同じ送り（180 Hz〜9 kHz・モノラル）→ プリディレイ → 畳み込み（モードごとの合成 IR）→ レベル → Dynamic Tail / 蓄積防止ゲイン',
+  'HALL では既存の後期残響の代わりに使う（初期反射はそのまま）。CINEMA では反射音に後期残響を加える',
+  '余韻の方向・広がり・周波数ごとの消え方は IR そのものに書き込む（線形時不変）。曲の途中の音にも停止後にも同じ性質が出て、オフライン書き出しでも再現される',
+  `蓄積防止: 残響の戻りが曲の平均レベル − ${TAIL_GUARD_MARGIN_DB} dB を超えたらゆっくり抑える（無音中は平均レベルを更新しない。停止後は、残響が減衰した分だけ抑制を外すため、余韻が持ち上がることはない）`,
+]
+
+export const TAIL_CAVEATS = [
+  '残響は合成 IR（実在の空間の測定ではない）',
+  'TAIL LENGTH の変更時は IR を再生成してクロスフェードする（長い IR の生成に数十 ms かかる）',
+  'Dynamic Tail は音量だけを見る（楽器・音程は見ない）。密なミックスでは「切れ目」が少なく効果が小さい',
 ]

@@ -3,7 +3,8 @@
 //   L/R ─→ STFT(2048/1024, √Hann) ─→ 帯域ごとのマスクでレイヤー分解 ─→ ISTFT
 //            CENTER / LEFT / RIGHT / AMB L / AMB R / BED L / BED R（7 レイヤーの和 = 原音）
 //   各レイヤー ─→ 距離処理（伝搬遅延・空気吸収ローパス・逆距離ゲイン）─→ 等パワーパン ─→ 出力0: 仮想スピーカー 12ch
-//   出力1: 原音を STFT 遅延分だけ遅らせた L/R（反射音・残響の送りに使い、直接音と時刻をそろえる）
+//   出力1: 反射音・残響への送り L/R = LEFT/RIGHT レイヤーを現在の左右位置に振り分けた、全レイヤーの和（距離処理なし、直接音と同じ STFT 遅延）。
+//          動きが 0 なら原音（の STFT 再構成）と一致し、Motion 中は反射音も音源の移動に追従する
 //
 // 位置はメディア時刻の純粋関数（motion.ts）。平滑化は 16 サンプルごとの制御レートで行い、
 // ゲイン類は制御点間を線形補間する（パン・距離の変化でクリックが出ない）。
@@ -15,6 +16,7 @@ import {
   distanceGain,
   distanceLowpassHz,
   panPair,
+  reflectionFeedGains,
   sourcePositions,
   SOURCE_COUNT,
   SPEAKER_COUNT,
@@ -31,6 +33,7 @@ import {
   type MotionReport,
   type MotionTransport,
   type MotionWorkletOptions,
+  transportTime,
 } from '../spatial/motionTypes'
 
 declare const sampleRate: number
@@ -84,10 +87,11 @@ class MotionProcessor extends AudioWorkletProcessor {
   private readonly plrRe = new Float64Array(BINS)
   private readonly plrIm = new Float64Array(BINS)
   private readonly statAlpha: number
-  // 原音の遅延（出力 1）
-  private readonly alignL = new Float32Array(N)
-  private readonly alignR = new Float32Array(N)
-  private alignPos = 0
+  // 反射音への送りの左右配分（制御点の前後）
+  private readonly fPrevL = new Float64Array(SOURCE_COUNT)
+  private readonly fPrevR = new Float64Array(SOURCE_COUNT)
+  private readonly fNextL = new Float64Array(SOURCE_COUNT)
+  private readonly fNextR = new Float64Array(SOURCE_COUNT)
   // レイヤーごとの距離処理
   private readonly dl: Float32Array[]
   private dlPos = 0
@@ -196,8 +200,6 @@ class MotionProcessor extends AudioWorkletProcessor {
     for (const a of this.acc) a.fill(0)
     for (const q of this.outQ) q.fill(0)
     for (const d of this.dl) d.fill(0)
-    this.alignL.fill(0)
-    this.alignR.fill(0)
     this.pll.fill(0)
     this.prr.fill(0)
     this.plrRe.fill(0)
@@ -207,11 +209,10 @@ class MotionProcessor extends AudioWorkletProcessor {
     this.snap = true
   }
 
-  /** 出力中の音に対応するメディア時刻（STFT の遅延分だけ前） */
+  /** 出力中の音に対応するメディア時刻（STFT の遅延分だけ前。ループ中は区間で折り返す） */
   private mediaTime(frameOffset: number): number {
     const t = this.transport
-    const base = t.playing ? currentTime + frameOffset / sampleRate - t.startedAt : t.pausedAt
-    return base - N / sampleRate
+    return t.playing ? transportTime(t, currentTime + (frameOffset - N) / sampleRate) : t.pausedAt - N / sampleRate
   }
 
   private fft(re: Float64Array, im: Float64Array): void {
@@ -359,6 +360,11 @@ class MotionProcessor extends AudioWorkletProcessor {
       this.pd[s] += (this.target[s].distance - this.pd[s]) * k
       const smoothedAz = (Math.atan2(this.px[s], this.py[s]) * 180) / Math.PI
       const [i0, i1, g0, g1] = panPair(smoothedAz)
+      const [fl, fr] = reflectionFeedGains(s, smoothedAz, this.layout)
+      this.fPrevL[s] = this.snap ? fl : this.fNextL[s]
+      this.fPrevR[s] = this.snap ? fr : this.fNextR[s]
+      this.fNextL[s] = fl
+      this.fNextR[s] = fr
       const gd = distanceGain(this.pd[s])
       const prev = this.gPrev[s]
       const next = this.gNext[s]
@@ -422,14 +428,6 @@ class MotionProcessor extends AudioWorkletProcessor {
       const frac = this.ctrlCount / CONTROL
       this.ctrlCount = (this.ctrlCount + 1) % CONTROL
 
-      // 出力 1: 原音を N サンプル遅らせる（反射音・残響の送り用）
-      const ap = this.alignPos
-      const dL = this.alignL[ap]
-      const dR = this.alignR[ap]
-      this.alignL[ap] = l
-      this.alignR[ap] = r
-      this.alignPos = (ap + 1) % N
-
       // STFT の入出力
       const fi = this.fill
       this.inL[N - H + fi] = l
@@ -444,8 +442,16 @@ class MotionProcessor extends AudioWorkletProcessor {
       if (this.debugLayers) {
         for (let s = 0; s < SOURCE_COUNT && s < aux.length; s++) aux[s][i] = this.layerVal[s]
       } else if (aux.length >= 2) {
-        aux[0][i] = dL
-        aux[1][i] = dR
+        // 出力 1: 反射音・残響への送り（各レイヤーを現在の左右位置へ）
+        let fl = 0
+        let fr = 0
+        for (let s = 0; s < SOURCE_COUNT; s++) {
+          const v = layerVal[s]
+          fl += v * (this.fPrevL[s] + (this.fNextL[s] - this.fPrevL[s]) * frac)
+          fr += v * (this.fPrevR[s] + (this.fNextR[s] - this.fPrevR[s]) * frac)
+        }
+        aux[0][i] = fl
+        aux[1][i] = fr
       }
 
       // 各レイヤー: 伝搬遅延 → 空気吸収 → パン（ゲインは制御点間を線形補間）

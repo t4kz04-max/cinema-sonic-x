@@ -62,6 +62,8 @@ export interface SpatialStatus {
   hrtfLatencyMs: number | null
   /** Motion Engine（AudioWorklet）が使えるか */
   motionAvailable: boolean
+  /** Spatial Tail: worklet = Dynamic Tail・蓄積防止あり / fallback = 残響のみ / null = 未初期化 */
+  tailEngine: 'worklet' | 'fallback' | null
 }
 
 export interface DspMeters {

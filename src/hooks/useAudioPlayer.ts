@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AudioEngine } from '../audio/AudioEngine'
 import { loadAudioFile } from '../audio/loadAudioFile'
+import type { LoopRegion, LoopType } from '../audio/loopRegion'
 import { DEFAULT_BASS_PARAMS, type BassParams } from '../audio/bassSpec'
 import { DEFAULT_SPATIAL_PARAMS, type SpatialParams } from '../audio/spatial/spatialSpec'
 import type { DspMeters, DspStatus, LoadError, LoadedAudio, PlaybackStatus } from '../types/audio'
@@ -14,6 +15,13 @@ export function volumePercentToGain(percent: number): number {
   return v * v
 }
 
+export interface LoopState {
+  enabled: boolean
+  type: LoopType
+}
+
+const INITIAL_LOOP: LoopState = { enabled: false, type: 'normal' }
+
 const NO_METERS: DspMeters = { bassGrDb: 0, limiterGrDb: 0, spatialLimiterGrDb: 0 }
 
 export function useAudioPlayer() {
@@ -22,6 +30,7 @@ export function useAudioPlayer() {
   const loadTokenRef = useRef(0)
   const bassParamsRef = useRef<BassParams>(DEFAULT_BASS_PARAMS)
   const spatialParamsRef = useRef<SpatialParams>(DEFAULT_SPATIAL_PARAMS)
+  const loopRef = useRef<LoopState>(INITIAL_LOOP)
 
   const [audio, setAudio] = useState<LoadedAudio | null>(null)
   const [status, setStatus] = useState<PlaybackStatus>('stopped')
@@ -35,6 +44,8 @@ export function useAudioPlayer() {
   const [spatialParams, setSpatialParamsState] = useState<SpatialParams>(DEFAULT_SPATIAL_PARAMS)
   const [dsp, setDsp] = useState<DspStatus | null>(null)
   const [meters, setMeters] = useState<DspMeters>(NO_METERS)
+  const [loop, setLoopState] = useState<LoopState>(INITIAL_LOOP)
+  const [musicRegion, setMusicRegion] = useState<LoopRegion | null>(null)
 
   const getEngine = useCallback((): AudioEngine => {
     if (!engineRef.current) {
@@ -90,6 +101,7 @@ export function useAudioPlayer() {
           return
         }
         engine.setBuffer(result.audio.buffer)
+        setMusicRegion(engine.getMusicRegion())
         setAudio(result.audio)
         setPosition(0)
       } finally {
@@ -113,6 +125,17 @@ export function useAudioPlayer() {
 
   const pause = useCallback(() => getEngine().pause(), [getEngine])
   const stop = useCallback(() => getEngine().stop(), [getEngine])
+  const cut = useCallback(() => getEngine().cut(), [getEngine])
+
+  const setLoop = useCallback(
+    (patch: Partial<LoopState>) => {
+      const next = { ...loopRef.current, ...patch }
+      loopRef.current = next
+      setLoopState(next)
+      getEngine().setLoop(next.enabled, next.type)
+    },
+    [getEngine],
+  )
 
   const togglePlay = useCallback(() => {
     if (status === 'playing') pause()
@@ -168,6 +191,7 @@ export function useAudioPlayer() {
   )
 
   const readMotion = useCallback(() => engineRef.current?.getMotionReport() ?? null, [])
+  const readTail = useCallback(() => engineRef.current?.getTailReport() ?? null, [])
 
   const readScope = useCallback(
     (left: Float32Array<ArrayBuffer>, right: Float32Array<ArrayBuffer>) => engineRef.current?.readScope(left, right) ?? false,
@@ -195,6 +219,10 @@ export function useAudioPlayer() {
     play,
     pause,
     stop,
+    cut,
+    loop,
+    setLoop,
+    musicRegion,
     togglePlay,
     seek,
     setVolume,
@@ -209,6 +237,7 @@ export function useAudioPlayer() {
     setSpatialParams,
     readScope,
     readMotion,
+    readTail,
     dsp,
     meters,
   }

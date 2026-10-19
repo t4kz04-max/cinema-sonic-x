@@ -3,7 +3,8 @@ import { loadDynamicsWorklet } from '../processingGraph'
 import { monoColorationDb, stereoColorationDb, stereoMetrics, type StereoMetrics } from '../stereoMetrics'
 import type { Envelope } from './motion'
 import { createSpatialGraph, loadMotionWorklet } from './spatialGraph'
-import { isMotionActive, wideSideCapDb, type ActiveSpatialMode, type SpatialParams } from './spatialSpec'
+import { loadTailWorklet } from './tailEngine'
+import { isMotionActive, isTailActive, wideSideCapDb, type ActiveSpatialMode, type SpatialParams } from './spatialSpec'
 
 /** 原音の中高域の幅から WIDE の Side ゲイン上限を決める */
 export function wideCapFor(before: StereoMetrics | null): number {
@@ -85,15 +86,18 @@ async function renderSpatial(
 ) {
   return render(excerpt, async (ctx, src) => {
     if (opts.useWorklet && !(await loadDynamicsWorklet(ctx))) throw new Error('解析用 AudioWorklet を読み込めませんでした')
-    // Motion ON なら Motion チェーンだけを作る（抜粋の先頭をメディア時刻 0 として動きを再現）
+    // Motion ON なら Motion チェーンだけを作る（抜粋の先頭をメディア時刻 0 として動きを再現）。
+    // Spatial Tail ON のときは残響が音量に効くため、モードのチェーン（反射音・Tail）も作る
     const motion = isMotionActive(params) && (await loadMotionWorklet(ctx))
+    const tail = isTailActive(params)
+    if (tail && opts.useWorklet) await loadTailWorklet(ctx)
     const g = createSpatialGraph(ctx, {
       params,
       bypass: false,
       trimDb,
       useWorklet: opts.useWorklet,
       hrtfLatencySeconds: opts.hrtfLatencySeconds,
-      modes: motion ? [] : [params.mode],
+      modes: motion && !tail ? [] : [params.mode],
       limiterEnabled,
       wideSideCapDb,
       motion: motion ? { envelope: opts.envelope ?? null } : undefined,

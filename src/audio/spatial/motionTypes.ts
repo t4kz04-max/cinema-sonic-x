@@ -12,12 +12,26 @@ export const MOTION_BED_HIGH_HZ = 200
 
 /**
  * 再生位置の基準。mediaTime(ctxTime) = playing ? ctxTime − startedAt : pausedAt
- * （startedAt = 再生開始時の ctx.currentTime − 開始位置）
+ * （startedAt = 再生開始時の ctx.currentTime − 開始位置）。
+ * ループ再生中は loopStart〜loopEnd で折り返す（transportTime）
  */
 export interface MotionTransport {
   playing: boolean
   startedAt: number
   pausedAt: number
+  /** ループ区間（秒）。loopEnd > loopStart のときだけ有効 */
+  loopStart?: number
+  loopEnd?: number
+}
+
+/** 文脈時刻 → メディア時刻（ループ区間で折り返す）。再生エンジン・Motion ワークレット・可視化で共通 */
+export function transportTime(t: MotionTransport, ctxTime: number): number {
+  if (!t.playing) return t.pausedAt
+  const m = ctxTime - t.startedAt
+  const a = t.loopStart ?? 0
+  const b = t.loopEnd ?? 0
+  if (b > a && m >= b) return a + ((m - b) % (b - a))
+  return m
 }
 
 export interface MotionWorkletOptions {

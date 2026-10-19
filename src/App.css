@@ -1655,3 +1655,44 @@
   color: var(--text-faint);
   line-height: 1.45;
 }
+
+/* ---------------- Phase 04: Spatial Tail / Loop ---------------- */
+.tail-modes {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.tail-controls {
+  margin-top: 4px;
+}
+.tail-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 8px;
+}
+.tail-loop {
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.tail-loop .spatial-param__desc {
+  flex-basis: 100%;
+  margin: 0;
+}
+.tail-meter {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.loop-btn {
+  position: relative;
+}
+.loop-btn.is-active {
+  color: var(--accent-hi);
+  box-shadow: 0 0 0 1px var(--accent-hi) inset;
+}
+.loop-btn__type {
+  position: absolute;
+  right: 3px;
+  bottom: 1px;
+  font-size: 9px;
+  font-weight: 700;
+}

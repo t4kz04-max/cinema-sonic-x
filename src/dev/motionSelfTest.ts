@@ -424,6 +424,12 @@ export async function runMotionSelfTest(): Promise<TestResult[]> {
     const out = await render(lrSignal, params)
     const a = bandIldTrack(out, 1000, 2500, 1.5, 25)
     const b = bandIldTrack(out, 3000, 6000, 1.5, 25)
+    // Phase 04: 反射音への送りが音源位置に追従するようにした（Phase 03 では反射音が固定で、既定値の変化幅は約 11 dB）
+    const cA = corr(a.ild, expectedIld(params, SRC.left, a.t, ildTables.left))
+    const cB = corr(b.ild, expectedIld(params, SRC.right, b.t, ildTables.right))
+    const rA = Math.max(...a.ild) - Math.min(...a.ild)
+    const rB = Math.max(...b.ild) - Math.min(...b.ild)
+    check('Phase 04: 既定値（反射あり）でも動きが埋もれない（ILD 変化幅 ≥ 15 dB・追従相関 ≥ 0.8）', Math.min(rA, rB) >= 15 && Math.min(cA, cB) >= 0.8, `LEFT ${f1(rA)} dB・相関 ${f2(cA)} / RIGHT ${f1(rB)} dB・相関 ${f2(cB)}`)
     check(
       '参考: 既定値（反射あり）での SWEEP の追従',
       true,

@@ -12,10 +12,11 @@ function prng(seed: number) {
 
 /** 残響のビルドアップ時間（拡散音場が立ち上がるまで） */
 const BUILD_UP_SECONDS = 0.012
-const MAX_IR_SECONDS = 4.5
+export const MAX_IR_SECONDS = 4.5
 
-export function synthesizeHallIR(rt60: number, sampleRate: number, seed = 1): [Float32Array, Float32Array] {
-  const length = Math.ceil(Math.min(rt60 * 1.3, MAX_IR_SECONDS) * sampleRate)
+/** maxSeconds: IR の最大長（HALL は 4.5 秒。Spatial Tail は長い残響時間のために延ばす。rt60 × 1.3 より短ければ結果は同じ） */
+export function synthesizeHallIR(rt60: number, sampleRate: number, seed = 1, maxSeconds = MAX_IR_SECONDS): [Float32Array, Float32Array] {
+  const length = Math.ceil(Math.min(rt60 * 1.3, maxSeconds) * sampleRate)
   const out: Float32Array[] = []
   for (let c = 0; c < 2; c++) {
     const rnd = prng(seed * 7919 + c * 104729)

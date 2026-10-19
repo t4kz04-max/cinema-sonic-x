@@ -9,8 +9,8 @@
 | 02 | 低音EQ（BASS BOOST）・サブベース（SUB BASS）・BYPASS | 実装済み（実音源での試聴確認待ち） |
 | 02.5 | EXTREME BASS・出力補正の再設計・スペクトル比較 | 実装済み（実楽曲での試聴確認待ち） |
 | SP | Spatial Audio Prototype（WIDE / CINEMA / HALL）※ docs/SPATIAL.md | 実装済み（試聴: CINEMA・HALL は効果あり、WIDE は小） |
-| 03 | Dynamic Spatial Motion Engine | 実装済み（最終の全テスト再実行と試聴が未完了） |
-| 04 | Immersive Audio Engine | 未着手 |
+| 03 | Dynamic Spatial Motion Engine | 実装済み・Chrome/Edge で検証済み（実楽曲での試聴は未実施） |
+| 04 | Immersive Audio Engine 2.0（Spatial Tail・Dynamic Tail・Loop） | 実装済み・Chrome/Edge で検証（1 件 FAIL、下記）。試聴は未実施 |
 | 05 | Spatial Preset System | 未着手 |
 | 06 | Audio Export Engine | 未着手 |
 | 07 | Video Processing Engine | 未着手 |
@@ -157,19 +157,35 @@ source → input ─┬─ dry(1/0) ──────────────�
 - [x] モノラル音源で異常なし、BYPASS で原音とサンプル一致
 - [x] 移動・切替でクリックノイズなし、出力ピーク ≤ -1 dBFS、位相相関 ≥ 0
 - [x] シーク・再開時に同じ位置を再現（オフラインレンダリングで検証）
-- [ ] CPU: 全チェーン構築時 51.7%（基準 50%）→ 未使用チェーンの切り離しを追加。再計測が未完了
-- [ ] Chrome / Edge で test:spatial・test:dsp の最終実行（メモリ不足で中断。未完了）
+- [x] CPU: 未使用チェーンの切り離し後、全チェーン構築時 22.2%（Phase 04 開始時に再計測。以前は 51.7%）
+- [x] Chrome / Edge で test:spatial（Spatial 50 + Motion 54 すべて PASS）・test:dsp（62/63、既知の EDM の FAIL のみ）を実行（Phase 04 の変更後）
 - [ ] 実楽曲・ヘッドホンでの試聴確認（未実施）
 
-## Phase 04 — Immersive Audio Engine
+## Phase 04 — Immersive Audio Engine 2.0（Spatial Tail・Dynamic Tail・Loop）
 
-Motion Engine の上に、没入感を高める音響処理を加える（旧 Phase 03 の倍音生成〈HARMONICS〉もここで扱う）。
+「音が空間内で動き、広がり、演奏が止まった後も自然な余韻が残る」。詳細・測定結果は docs/SPATIAL.md。
+
+**実装内容**
+- 既存 HALL の余韻を解析し、ベースラインを保存（`src/dev/hallBaseline.json`、Phase 04 の変更前のコードで測定）
+- SPATIAL TAIL（CINEMA / HALL）: NATURAL（既存 HALL と同じ IR）/ DISTANCE（暗く・狭く遠ざかる）/ RIPPLE（中央から外側へ広がる演出）。TAIL LENGTH・TAIL INTENSITY
+- DYNAMIC TAIL: 演奏が密な間は残響を最大 8 dB 下げ、音の切れ目で戻す（Attack 25 ms・Hold 150 ms・Release 250 ms・平滑化 10 ms）。蓄積防止つき
+- Motion と残響の統合: LEFT / RIGHT の初期反射への送りが音源の左右位置に追従。後期残響はモノラル送りのまま
+- LOOP: NORMAL（ファイル全体、境界で前回の後期残響を消す）/ SPATIAL（音楽の区間、前回の余韻と次の冒頭を重ねる）
+- STOP（直接音だけ 12 ms で止め余韻は残す）/ PAUSE（出力を 20 ms で止め残響を消す・位置保持）/ CUT（直接音・余韻とも 20 ms で止める）
+- 副次的な修正: ランプが過去から始まる不具合（ORIGINAL/PROCESSED の 2 回目以降の切替で値が飛ぶ）、解析用の OfflineAudioContext が MessagePort の受信設定で解放されない不具合、解析の間引き（250 ms）
 
 **完了条件**
-- [ ] 高さ方向（仰角）の表現、前後の弁別を改善する処理を実装し、測定（ILD/ITD・スペクトル）で効果を確認
-- [ ] 低音の存在感を倍音生成で補う処理（小型スピーカー・ヘッドホン向け）を実装し、元の低域を過剰に増やさないことを確認
-- [ ] 重低音エンジンと空間エンジンを直列に使ったときのゲイン構造（ピーク・ラウドネス）を検証
-- [ ] 既存テスト（test:dsp / test:spatial）に回帰がない
+- [x] 既存 HALL の余韻が維持されている（Tail OFF がベースラインと 10 ms ごとのエネルギー差 0.0000 dB、NATURAL 50/50 と既存 HALL の差 -154.8 dB）
+- [x] Spatial Tail の 3 モードが動作する（残響時間・高域減衰・IACC・S/M の時間変化を測定）
+- [x] Dynamic Tail が動作する（演奏中 -8 dB、切れ目で -0.3 dB まで戻る、ゲイン ≤ 1、ポンピングなし）
+- [x] Motion と残響の統合（既定値の SWEEP の ILD 変化幅 約 11 dB → 16.1 / 17.6 dB、追従相関 0.95 / 0.97。後期残響は不変）
+- [x] NORMAL LOOP / SPATIAL LOOP が動作する（オフライン 60 秒 × 2、実時間の再生エンジン 60 秒、実アプリの UI で確認）
+- [x] STOP / PAUSE / CUT が動作する（オフライン検証と実アプリの出力レベルで確認）
+- [x] Chrome / Edge で test:tail・test:spatial・test:dsp を実行（test:tail 96/97: Motion＋Tail＋Dynamic の 1 条件でラウドネス -1.3 LU が基準 ±1 LU を外れる）
+- [x] build / lint 成功
+- [ ] 実楽曲・ヘッドホンでの試聴（未実施）
+
+**今回の Phase 04 に含まれなかった旧計画の項目（未実装）**: 仰角・前後の弁別の改善、倍音生成（HARMONICS）。どの Phase で扱うかは未定。
 
 ## Phase 05 — Spatial Preset System
 

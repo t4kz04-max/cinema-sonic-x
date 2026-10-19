@@ -4,6 +4,10 @@ import { SPEAKER_AZIMUTHS, SPEAKER_COUNT, type Envelope } from './motion'
 import { MOTION_FFT_SIZE, type MotionMessage, type MotionReport, type MotionTransport, type MotionWorkletOptions } from './motionTypes'
 import { dynamicsSettingsFor } from '../processingGraph'
 import { synthesizeHallIR } from './hallImpulse'
+import { BUTTERWORTH_Q_DB, dbToGain, fadeGate, holdAt, MODE_FADE_SECONDS, monoGain, rampLinear, setParam, stereoGain } from './nodeUtils'
+import { ReverbBus } from './reverbBus'
+import { createTail, type TailChain } from './tailEngine'
+import type { TailReport } from './tailTypes'
 import {
   CINEMA_REFLECTIONS,
   CINEMA_TIMBRE_EQ,
@@ -13,9 +17,11 @@ import {
   HALL_SEND_LOWPASS_HZ,
   hallSettings,
   isMotionActive,
+  isTailActive,
   motionControl,
   motionLayout,
   motionSupported,
+  tailSupported,
   WIDE_AMBIENCE_HIGHPASS_HZ,
   WIDE_SHELF_HZ,
   wideSettings,
@@ -24,61 +30,11 @@ import {
   type SpatialParams,
 } from './spatialSpec'
 
-const PARAM_TC = 0.03
-const MODE_FADE_SECONDS = 0.08
 const BYPASS_FADE_SECONDS = 0.04
 const IR_FADE_SECONDS = 0.15
-/** lowpass/highpass の Q は dB 指定。Butterworth 相当 */
-const BUTTERWORTH_Q_DB = 20 * Math.log10(Math.SQRT1_2)
 /** 出力段のリミッター（重低音エンジンのワークレットを低域入力なしで使う）の低域しきい値。到達しない値 */
 const LIMITER_ONLY_BASS_THRESHOLD_DB = 100
-
-const dbToGain = (db: number) => Math.pow(10, db / 20)
 const deg = (d: number) => (d * Math.PI) / 180
-
-function holdAt(param: AudioParam, time: number): void {
-  if (typeof param.cancelAndHoldAtTime === 'function') {
-    param.cancelAndHoldAtTime(time)
-  } else {
-    const v = param.value
-    param.cancelScheduledValues(time)
-    param.setValueAtTime(v, time)
-  }
-}
-
-function setParam(ctx: BaseAudioContext, param: AudioParam, value: number, smooth: boolean, tc = PARAM_TC): void {
-  if (!smooth) {
-    param.cancelScheduledValues(0)
-    param.value = value
-    return
-  }
-  const t = ctx.currentTime
-  holdAt(param, t)
-  param.setTargetAtTime(value, t, tc)
-}
-
-function rampLinear(ctx: BaseAudioContext, param: AudioParam, value: number, seconds: number): void {
-  const t = ctx.currentTime
-  holdAt(param, t)
-  param.linearRampToValueAtTime(value, t + seconds)
-}
-
-/** start 秒後から MODE_FADE_SECONDS の線形フェード（smooth=false なら即時） */
-function fadeGate(ctx: BaseAudioContext, param: AudioParam, target: number, smooth: boolean, start = 0): void {
-  if (!smooth) {
-    setParam(ctx, param, target, false)
-    return
-  }
-  const t0 = ctx.currentTime + start
-  holdAt(param, ctx.currentTime)
-  param.setValueAtTime(param.value, t0)
-  param.linearRampToValueAtTime(target, t0 + MODE_FADE_SECONDS)
-}
-
-const stereoGain = (ctx: BaseAudioContext, gain = 1) =>
-  new GainNode(ctx, { gain, channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'speakers' })
-const monoGain = (ctx: BaseAudioContext, gain = 1) =>
-  new GainNode(ctx, { gain, channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'speakers' })
 
 interface ModeChain {
   input: AudioNode
@@ -90,6 +46,10 @@ interface ModeChain {
   setSideCap?(capDb: number, smooth: boolean): void
   /** CINEMA / HALL のみ: 直接音の ON/OFF（Motion ON 時は Motion が直接音を担当する）。start 秒後から切り替える */
   setDirectEnabled?(on: boolean, smooth: boolean, start?: number): void
+  /** HALL のみ: 既存の後期残響の ON/OFF（Spatial Tail ON 時は Tail が後期残響を担当する） */
+  setLateEnabled?(on: boolean, smooth: boolean, start?: number): void
+  /** HALL のみ: チェーン入力に時刻 at までに入った音の後期残響を消す（プリディレイ分はチェーン内で足す） */
+  resetLate?(at: number, fadeSeconds: number): void
 }
 
 // ---------------- WIDE: Mid/Side ----------------
@@ -319,17 +279,20 @@ function createHall(ctx: BaseAudioContext, p: SpatialParams): ModeChain {
   const preDelay = new DelayNode(ctx, { maxDelayTime: 0.2, delayTime: s.preDelayMs / 1000 })
   sendLp.connect(lateSend).connect(preDelay)
   const late = stereoGain(ctx, dbToGain(s.lateGainDb))
-  const convs = [0, 1].map(() => {
-    const conv = new ConvolverNode(ctx, { disableNormalization: true })
-    const g = stereoGain(ctx, 0)
-    preDelay.connect(conv).connect(g).connect(late)
-    return { conv, g }
-  })
-  convs[0].conv.buffer = hallIrBuffer(ctx, s.rt60)
-  convs[0].g.gain.value = 1
-  let active = 0
+  // IR の切替（クロスフェード）と残響の消去は ReverbBus が受け持つ（定常時は畳み込み 1 つ・ゲイン 1 で従来と同じ値）
+  const lateBus = new ReverbBus(ctx, preDelay, late, 1)
+  lateBus.setBuffer(hallIrBuffer(ctx, s.rt60), 0)
   let activeRt60 = s.rt60
-  late.connect(out)
+  // Spatial Tail ON 時に既存の後期残響を止めるゲート（通常は 1）。止めている間は送りを切り離して畳み込みを休ませる
+  const lateGate = stereoGain(ctx, 1)
+  late.connect(lateGate).connect(out)
+  let lateConnected = true
+  let lateTimer: ReturnType<typeof setTimeout> | null = null
+  const setLateInput = (on: boolean) => {
+    if (on && !lateConnected) sendLp.connect(lateSend)
+    if (!on && lateConnected) sendLp.disconnect(lateSend)
+    lateConnected = on
+  }
 
   return {
     input,
@@ -337,6 +300,19 @@ function createHall(ctx: BaseAudioContext, p: SpatialParams): ModeChain {
     latencySeconds: 0,
     setDirectEnabled(on, smooth, start = 0) {
       fadeGate(ctx, directGate.gain, on ? 1 : 0, smooth, start)
+    },
+    setLateEnabled(on, smooth, start = 0) {
+      if (lateTimer) clearTimeout(lateTimer)
+      lateTimer = null
+      if (on) setLateInput(true)
+      fadeGate(ctx, lateGate.gain, on ? 1 : 0, smooth, start)
+      if (!on) {
+        if (smooth) lateTimer = setTimeout(() => setLateInput(false), (start + MODE_FADE_SECONDS + 0.1) * 1000)
+        else setLateInput(false)
+      }
+    },
+    resetLate(at, fadeSeconds) {
+      lateBus.reset(at + preDelay.delayTime.value, fadeSeconds)
     },
     update(np, smooth) {
       s = hallSettings(np)
@@ -347,16 +323,7 @@ function createHall(ctx: BaseAudioContext, p: SpatialParams): ModeChain {
       setParam(ctx, late.gain, dbToGain(s.lateGainDb), smooth)
       erTaps(s.erScale).forEach((t, i) => setParam(ctx, tapNodes[i].delayTime, t.delayMs / 1000, smooth, 0.1))
       if (Math.abs(s.rt60 - activeRt60) > 0.03) {
-        const next = 1 - active
-        convs[next].conv.buffer = hallIrBuffer(ctx, s.rt60)
-        if (smooth) {
-          rampLinear(ctx, convs[next].g.gain, 1, IR_FADE_SECONDS)
-          rampLinear(ctx, convs[active].g.gain, 0, IR_FADE_SECONDS)
-        } else {
-          setParam(ctx, convs[next].g.gain, 1, false)
-          setParam(ctx, convs[active].g.gain, 0, false)
-        }
-        active = next
+        lateBus.setBuffer(hallIrBuffer(ctx, s.rt60), smooth ? IR_FADE_SECONDS : 0)
         activeRt60 = s.rt60
       }
     },
@@ -453,7 +420,8 @@ function createMotion(
   aligned.connect(alignedHall)
 
   let reportListener: ((r: MotionReport) => void) | null = null
-  worklet.port.onmessage = (e: MessageEvent<MotionReport>) => reportListener?.(e.data)
+  // 通知を使うときだけ受信する（onmessage を設定した MessagePort は閉じるまで GC されず、解析用の OfflineAudioContext ごと残るため）
+  if (reportIntervalMs > 0) worklet.port.onmessage = (e: MessageEvent<MotionReport>) => reportListener?.(e.data)
 
   return {
     input,
@@ -488,6 +456,14 @@ export interface SpatialGraph {
   setEnvelope(envelope: Envelope | null): void
   /** Motion Engine が実際に使っている位置の通知 */
   onMotionReport(listener: ((r: MotionReport) => void) | null): void
+  /** Spatial Tail を構築したか（CINEMA / HALL を含む場合）と、Dynamic Tail が使えるか */
+  tailEngine: 'worklet' | 'fallback' | null
+  /** グラフ入力に時刻 at までに入った音の後期残響（HALL・Spatial Tail）を消す。PAUSE・CUT・NORMAL LOOP の境界で使う */
+  resetReverb(at: number, fadeSeconds: number): void
+  /** Dynamic Tail・蓄積防止の状態の通知 */
+  onTailReport(listener: ((r: TailReport) => void) | null): void
+  /** テスト用: Dynamic Tail のゲイン（モノラル）と、畳み込みの組の数 */
+  debug: { tailGain: AudioNode | null; reverbSlots(): number }
 }
 
 export interface SpatialGraphOptions {
@@ -617,10 +593,55 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
     motion.ring.connect(ringGate).connect(wetSum)
   }
 
+  // Spatial Tail（CINEMA / HALL で 1 つを共有）。入力は Motion OFF なら原音（CINEMA は HRTF の遅延分だけ遅らせる）、
+  // Motion ON なら Motion の遅延をそろえた原音。HALL では既存の後期残響と入れ替える
+  const tail: TailChain | null = modes.some((m) => tailSupported(m))
+    ? createTail(ctx, opts.params, opts.useWorklet, opts.reportIntervalMs ?? 0)
+    : null
+  const tailOn = (p: SpatialParams) => !!tail && isTailActive(p) && modes.includes(p.mode as ActiveSpatialMode)
+  const tailRootDelayFor = (p: SpatialParams) => (p.mode === 'cinema' ? opts.hrtfLatencySeconds : 0)
+  let tailFeed: {
+    rootDelay: DelayNode
+    rootGate: GainNode
+    alignGate: GainNode | null
+    rootOn: boolean
+    alignOn: boolean
+    timer: ReturnType<typeof setTimeout> | null
+  } | null = null
+  let tailGate: GainNode | null = null
+  const setTailInputs = (wantRoot: boolean, wantAlign: boolean) => {
+    if (!tailFeed) return
+    if (wantRoot && !tailFeed.rootOn) root.connect(tailFeed.rootDelay)
+    if (!wantRoot && tailFeed.rootOn) root.disconnect(tailFeed.rootDelay)
+    tailFeed.rootOn = wantRoot
+    if (motion && tailFeed.alignGate) {
+      if (wantAlign && !tailFeed.alignOn) motion.alignedHall.connect(tailFeed.alignGate)
+      if (!wantAlign && tailFeed.alignOn) motion.alignedHall.disconnect(tailFeed.alignGate)
+      tailFeed.alignOn = wantAlign
+    }
+  }
+  if (tail) {
+    const on = tailOn(opts.params)
+    const rootDelay = new DelayNode(ctx, { maxDelayTime: 0.1, delayTime: tailRootDelayFor(opts.params), channelCount: 2, channelCountMode: 'explicit' })
+    const rootGate = stereoGain(ctx, on && !initialMotion ? 1 : 0)
+    rootDelay.connect(rootGate).connect(tail.input)
+    let alignGate: GainNode | null = null
+    if (motion) {
+      alignGate = stereoGain(ctx, on && initialMotion ? 1 : 0)
+      alignGate.connect(tail.input)
+    }
+    tailFeed = { rootDelay, rootGate, alignGate, rootOn: false, alignOn: false, timer: null }
+    setTailInputs(on && !initialMotion, on && initialMotion)
+    tailGate = stereoGain(ctx, on ? 1 : 0)
+    tail.output.connect(tailGate).connect(wetSum)
+    if (on) slots.hall?.chain.setLateEnabled?.(false, false)
+  }
+
   const latencyOf = (p: SpatialParams) =>
     p.mode === 'off' ? 0 : motionOn(p) ? motion!.latencySeconds : (slots[p.mode]?.chain.latencySeconds ?? 0)
   dryAlign.delayTime.value = latencyOf(opts.params)
-  let current = { mode: opts.params.mode, motion: initialMotion }
+  let current = { mode: opts.params.mode, motion: initialMotion, tail: tailOn(opts.params) }
+  let currentParams = opts.params
 
   let worklet: AudioWorkletNode | null = null
   let trim: GainNode | null = null
@@ -641,7 +662,7 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
     // 低域入力（0）は接続しない。入力 1 に全帯域を入れ、トリム＋サンプルピークリミッターだけを使う
     mixSum.connect(worklet, 0, 1)
     worklet.connect(bypassWet).connect(output)
-    worklet.port.onmessage = (e: MessageEvent<DynamicsMeter>) => meterListener?.(e.data)
+    if ((opts.reportIntervalMs ?? 0) > 0) worklet.port.onmessage = (e: MessageEvent<DynamicsMeter>) => meterListener?.(e.data)
   } else {
     trim = stereoGain(ctx, dbToGain(Math.min(0, opts.trimDb)))
     mixSum.connect(trim).connect(bypassWet).connect(output)
@@ -652,15 +673,17 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
     output,
     engine: worklet ? 'worklet' : 'fallback',
     setParams(p, smooth) {
+      currentParams = p
       const nw = Math.min(Math.max(p.wetDry / 100, 0), 1)
       setParam(ctx, mixWet.gain, nw, smooth)
       setParam(ctx, mixDry.gain, 1 - nw, smooth)
       for (const m of modes) slots[m]?.chain.update(p, smooth)
       // Motion の位置・パラメーター（OFF ならワークレットはフェード後に休止する）
       motion?.post({ type: 'params', layout: motionLayout(p), control: motionControl(p) })
+      tail?.update(p, smooth)
 
-      const next = { mode: p.mode, motion: motionOn(p) }
-      if (next.mode === current.mode && next.motion === current.motion) return
+      const next = { mode: p.mode, motion: motionOn(p), tail: tailOn(p) }
+      if (next.mode === current.mode && next.motion === current.motion && next.tail === current.tail) return
       // Motion を ON にする場合は、休止していたワークレットに音がたまるまで切替開始を遅らせる
       const start = next.motion && !current.motion ? MOTION_WAKE_SECONDS : 0
       for (const m of modes) {
@@ -686,6 +709,26 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
         if (motionSupported(m)) slot.chain.setDirectEnabled?.(!useMotion, smooth, start)
       }
       if (ringGate) fadeGate(ctx, ringGate.gain, next.motion ? 1 : 0, smooth, start)
+      if (tail && tailFeed && tailGate) {
+        const feed = tailFeed
+        const wantRoot = next.tail && !next.motion
+        const wantAlign = next.tail && next.motion
+        if (feed.timer) clearTimeout(feed.timer)
+        setTailInputs(wantRoot || feed.rootOn, wantAlign || feed.alignOn)
+        feed.timer = setTimeout(
+          () => {
+            feed.timer = null
+            setTailInputs(wantRoot, wantAlign)
+          },
+          (start + MODE_FADE_SECONDS + DISCONNECT_MARGIN_SECONDS) * 1000 * (smooth ? 1 : 0),
+        )
+        fadeGate(ctx, feed.rootGate.gain, wantRoot ? 1 : 0, smooth, start)
+        if (feed.alignGate) fadeGate(ctx, feed.alignGate.gain, wantAlign ? 1 : 0, smooth, start)
+        setParam(ctx, feed.rootDelay.delayTime, tailRootDelayFor(p), smooth, 0.05)
+        fadeGate(ctx, tailGate.gain, next.tail ? 1 : 0, smooth, start)
+        // HALL の既存の後期残響と Tail を同じフェードで入れ替える（NATURAL の既定値では同じ信号なので継ぎ目がない）
+        slots.hall?.chain.setLateEnabled?.(!next.tail, smooth, start)
+      }
       if (next.mode !== 'off') {
         const t0 = ctx.currentTime + start
         if (smooth) {
@@ -724,6 +767,21 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
     },
     onMotionReport(listener) {
       motion?.onReport(listener)
+    },
+    tailEngine: tail ? tail.engine : null,
+    resetReverb(at, fadeSeconds) {
+      // at はグラフ入力の時刻。各チェーンの入力までの遅延（Motion の STFT・HRTF の遅延合わせ）を足して、
+      // 「at 以降に入った音の残響」だけが新しい畳み込みに入るようにする
+      const motionFeed = motion && motionOn(currentParams) ? motion.latencySeconds : null
+      slots.hall?.chain.resetLate?.(at + (motionFeed ?? 0), fadeSeconds)
+      tail?.reset(at + (motionFeed ?? tailRootDelayFor(currentParams)), fadeSeconds)
+    },
+    onTailReport(listener) {
+      tail?.onReport(listener)
+    },
+    debug: {
+      tailGain: tail?.gainProbe ?? null,
+      reverbSlots: () => tail?.slotCount ?? 0,
     },
   }
 }

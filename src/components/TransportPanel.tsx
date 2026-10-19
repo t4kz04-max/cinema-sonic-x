@@ -2,7 +2,8 @@ import { useState } from 'react'
 import type { AudioPlayer } from '../hooks/useAudioPlayer'
 import { volumePercentToGain } from '../hooks/useAudioPlayer'
 import { formatDb, formatTime, gainToDb } from '../utils/format'
-import { PauseIcon, PlayIcon, StopIcon, VolumeIcon } from './Icons'
+import { isTailActive, TAIL_MODE_DOCS } from '../audio/spatial/spatialSpec'
+import { CutIcon, LoopIcon, PauseIcon, PlayIcon, StopIcon, VolumeIcon } from './Icons'
 import { Badge, Panel } from './Panel'
 import { RangeControl } from './RangeControl'
 import { Waveform } from './Waveform'
@@ -45,12 +46,15 @@ function nodeClass(kind: NodeKind, bypass: boolean): string {
 }
 
 export function TransportPanel({ player }: TransportPanelProps) {
-  const { audio, status, position, duration, volume, bypass, dsp, bassEnabled, spatialParams } = player
+  const { audio, status, position, duration, volume, bypass, dsp, bassEnabled, spatialParams, loop } = player
   const bassPath = dsp?.dynamicsEngine === 'fallback' ? FALLBACK_PATH : SIGNAL_PATH
   // VOLUME / OUTPUT の手前に空間処理を入れて表示する
   const path = [
     ...bassPath.slice(0, -2).map((n) => (n.kind === 'process' && !bassEnabled ? { ...n, kind: 'pending' as const, note: undefined } : n)),
     { name: SPATIAL_LABEL[spatialParams.mode], kind: spatialParams.mode === 'off' ? ('pending' as const) : ('process' as const) },
+    ...(isTailActive(spatialParams) && spatialParams.tailMode !== 'off'
+      ? [{ name: `TAIL: ${TAIL_MODE_DOCS[spatialParams.tailMode].label}${spatialParams.dynamicTail ? ' + DYNAMIC' : ''}`, kind: 'process' as const }]
+      : []),
     ...bassPath.slice(-2),
   ]
   // シークバーのドラッグ中は表示だけ更新し、離した時点でシークする（ソース再生成によるノイズ防止）
@@ -117,10 +121,20 @@ export function TransportPanel({ player }: TransportPanelProps) {
           <button
             type="button"
             className="btn-round btn-round--secondary"
+            onClick={player.cut}
+            disabled={disabled}
+            aria-label="CUT（直接音と余韻を止める）"
+            title="CUT: 直接音と余韻の両方を止めて先頭へ"
+          >
+            <CutIcon />
+          </button>
+          <button
+            type="button"
+            className="btn-round btn-round--secondary"
             onClick={player.stop}
             disabled={disabled}
-            aria-label="停止"
-            title="停止（先頭に戻る）"
+            aria-label="停止（余韻を残す）"
+            title="STOP: 直接音を止めて先頭へ（残響の余韻は残す）"
           >
             <StopIcon />
           </button>
@@ -133,6 +147,18 @@ export function TransportPanel({ player }: TransportPanelProps) {
             title={status === 'playing' ? '一時停止（Space）' : '再生（Space）'}
           >
             {status === 'playing' ? <PauseIcon size={28} /> : <PlayIcon size={28} />}
+          </button>
+          <button
+            type="button"
+            className={`btn-round btn-round--secondary loop-btn${loop.enabled ? ' is-active' : ''}`}
+            onClick={() => player.setLoop({ enabled: !loop.enabled })}
+            disabled={disabled}
+            aria-pressed={loop.enabled}
+            aria-label={`LOOP ${loop.enabled ? 'ON' : 'OFF'}`}
+            title={`LOOP（${loop.type === 'normal' ? 'NORMAL' : 'SPATIAL'}）: ${loop.enabled ? 'ON' : 'OFF'}。種類は空間音響パネルで切替`}
+          >
+            <LoopIcon />
+            {loop.enabled && <span className="loop-btn__type">{loop.type === 'normal' ? 'N' : 'S'}</span>}
           </button>
         </div>
 

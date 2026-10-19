@@ -6,7 +6,21 @@ import { linearToDb } from './loudness'
 import { analyzeSpatialSource, buildSpatialExcerpt, planSpatial, wideCapFor } from './spatial/spatialAnalysis'
 import type { Envelope } from './spatial/motion'
 import { computeEnvelope } from './spatial/motionEnvelope'
-import type { MotionReport, MotionTransport } from './spatial/motionTypes'
+import { transportTime, type MotionReport, type MotionTransport } from './spatial/motionTypes'
+import { linearRampAt } from './spatial/nodeUtils'
+import {
+  fadeOutSource,
+  nextLoopBoundary,
+  NORMAL_LOOP_RESET_FADE_SECONDS,
+  restoreOutput,
+  SEEK_FADE_SECONDS,
+  silenceOutput,
+  SILENCE_FADE_SECONDS,
+  STOP_FADE_SECONDS,
+} from './transportOps'
+import { loadTailWorklet } from './spatial/tailEngine'
+import type { TailReport } from './spatial/tailTypes'
+import { loopBounds, musicRegion, type LoopRegion, type LoopType } from './loopRegion'
 import { createSpatialGraph, loadMotionWorklet, measureHrtfLatency, type SpatialGraph } from './spatial/spatialGraph'
 import { DEFAULT_SPATIAL_PARAMS, type SpatialParams } from './spatial/spatialSpec'
 import type { StereoMetrics } from './stereoMetrics'
@@ -54,11 +68,23 @@ const INITIAL_DSP_STATUS: DspStatus = {
     predictedLimiterGrDb: null,
     hrtfLatencyMs: null,
     motionAvailable: false,
+    tailEngine: null,
   },
 }
 
 /** Motion の位置レポート間隔（可視化用） */
 const MOTION_REPORT_MS = 33
+
+/**
+ * 解析（OfflineAudioContext でのレンダリング）を始めるまでの待ち時間。スライダー操作中に何度も解析しない。
+ * Chrome は AudioWorklet を読み込んだ OfflineAudioContext を解放しないため、解析 1 回ごとにレンダリング結果
+ * （数 MB）がメモリに残る（ブラウザの挙動。回数を減らして影響を抑える）
+ */
+const PLAN_DEBOUNCE_MS = 250
+/** ループ境界の何秒前に残響の消去を予約するか */
+const LOOP_ARM_AHEAD_SECONDS = 0.4
+/** 1 周がこれより短いループでは境界の残響消去をしない */
+const LOOP_RESET_MIN_PERIOD_SECONDS = 1
 
 /** ベクトルスコープ用 AnalyserNode のサイズ */
 const SCOPE_FFT_SIZE = 2048
@@ -66,7 +92,11 @@ const SCOPE_FFT_SIZE = 2048
 /**
  * 再生グラフ:
  *   AudioBufferSourceNode → ProcessingGraph（重低音: EQ / 低域コンプ / トリム / リミッター）
- *     → SpatialGraph（WIDE / CINEMA / HALL / トリム / リミッター）→ GainNode(モニター音量) → destination
+ *     → SpatialGraph（WIDE / CINEMA / HALL / Motion / Spatial Tail / トリム / リミッター）
+ *     → GainNode(出力ゲート: PAUSE / CUT) → GainNode(モニター音量) → destination
+ *
+ * 停止系: STOP = 直接音だけフェードアウト（余韻は残す）、PAUSE = 位置を保持して出力をすぐ止め残響を消す、
+ * CUT = 直接音・残響とも止めて先頭へ。ループは AudioBufferSourceNode のネイティブループ（サンプル単位で正確）
  *
  * ORIGINAL/PROCESSED（setBypass）は両方の段を同時に BYPASS する。各段の BYPASS 経路はゲイン 1 のみで、
  * 2 段直列でも原音とビット一致する。重低音エンジンは setBassEnabled で個別に ON/OFF できる。
@@ -85,7 +115,18 @@ export class AudioEngine {
   private useWorklet = false
   private makeupCancel = 1
   private buffer: AudioBuffer | null = null
-  private source: AudioBufferSourceNode | null = null
+  /** 再生中の音源と、そのフェード用ゲイン（定常時は 1 = 原音と同じ値） */
+  private source: { node: AudioBufferSourceNode; gain: GainNode } | null = null
+  /** PAUSE / CUT で出力を止めるゲート（定常時は 1） */
+  private outputGate: GainNode | null = null
+  /** PAUSE / CUT で出力を止めた時刻（ctx 時刻）。再開時に遅延線が空になるまで待つ */
+  private silencedAt: number | null = null
+  private loopEnabled = false
+  private loopType: LoopType = 'normal'
+  /** SPATIAL LOOP 用: 音楽が鳴っている区間 */
+  private region: LoopRegion | null = null
+  private loopTimer: ReturnType<typeof setTimeout> | null = null
+  private tailReport: TailReport | null = null
   /** 再生開始時の ctx.currentTime からバッファ上の位置を逆算するための基準 */
   private startedAt = 0
   /** 停止・一時停止中の再生位置（秒） */
@@ -117,6 +158,8 @@ export class AudioEngine {
   private analysisToken = 0
   private planning = false
   private planDirty = false
+  private planTimer: ReturnType<typeof setTimeout> | null = null
+  private spatialPlanTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(initialVolume: number) {
     this.volume = initialVolume
@@ -172,6 +215,7 @@ export class AudioEngine {
 
     this.hrtfLatency = await measureHrtfLatency(ctx.sampleRate)
     const motionOk = await loadMotionWorklet(ctx)
+    if (this.useWorklet) await loadTailWorklet(ctx)
     const spatial = createSpatialGraph(ctx, {
       params: this.spatialParams,
       bypass: this.spatialBypassed(),
@@ -188,8 +232,13 @@ export class AudioEngine {
     spatial.onMeter((m) => {
       this.meters = { ...this.meters, spatialLimiterGrDb: m.limiterGrDb }
     })
+    spatial.onTailReport((r) => {
+      this.tailReport = r
+    })
     graph.output.connect(spatial.input)
-    spatial.output.connect(gain)
+    const outputGate = new GainNode(ctx, { gain: 1 })
+    spatial.output.connect(outputGate).connect(gain)
+    this.outputGate = outputGate
 
     // ベクトルスコープ（モニター音量の前で取り出す）
     const split = new ChannelSplitterNode(ctx, { numberOfOutputs: 2 })
@@ -206,7 +255,12 @@ export class AudioEngine {
     this.scope = { left, right }
     this.updateDsp({
       dynamicsEngine: graph.engine,
-      spatial: { ...this.dsp.spatial, hrtfLatencyMs: this.hrtfLatency * 1000, motionAvailable: spatial.motionAvailable },
+      spatial: {
+        ...this.dsp.spatial,
+        hrtfLatencyMs: this.hrtfLatency * 1000,
+        motionAvailable: spatial.motionAvailable,
+        tailEngine: spatial.tailEngine,
+      },
     })
     return ctx
   }
@@ -218,8 +272,14 @@ export class AudioEngine {
   }
 
   setBuffer(buffer: AudioBuffer): void {
-    this.teardownSource()
+    // 前の曲の直接音・余韻は残さない（CUT と同じ）
+    if (this.status === 'playing') this.silenceOutput()
+    this.teardownSource(this.status === 'playing' ? SILENCE_FADE_SECONDS : 0)
     this.buffer = buffer
+    this.region = musicRegion(
+      Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c)),
+      buffer.sampleRate,
+    )
     this.offset = 0
     this.setStatus('stopped')
     this.updateEnvelope()
@@ -233,31 +293,89 @@ export class AudioEngine {
     // 自動再生ポリシーにより suspended で生成されることがあるため、ユーザー操作時に再開する
     if (ctx.state === 'suspended') await ctx.resume()
     if (this.offset >= this.buffer.duration) this.offset = 0
-    this.startSource(this.offset)
+    const now = ctx.currentTime
+    let when = now
+    if (this.silencedAt !== null && this.outputGate) {
+      // PAUSE / CUT で止めた出力を戻す。直後の再開なら遅延線が空になるまで待ってから始める
+      when = restoreOutput(ctx, this.outputGate, this.silencedAt)
+      this.silencedAt = null
+    }
+    this.startSource(this.offset, when, 0)
     this.setStatus('playing')
   }
 
+  /** PAUSE: 再生位置を保持し、出力（直接音・余韻とも）を速やかに止める。再開時は同じ位置・同じ Motion の時刻から */
   pause(): void {
     if (this.status !== 'playing') return
     this.offset = this.getPosition()
-    this.teardownSource()
+    this.silenceOutput()
+    this.teardownSource(SILENCE_FADE_SECONDS)
     this.setStatus('paused')
     this.sendTransport()
   }
 
+  /** STOP: 直接音を速やかに止めて先頭へ。反射音・残響（HALL・Spatial Tail）の余韻は自然に消えるまで残す */
   stop(): void {
-    this.teardownSource()
+    this.teardownSource(this.status === 'playing' ? STOP_FADE_SECONDS : 0)
     this.offset = 0
     this.setStatus('stopped')
     this.sendTransport()
   }
 
+  /** CUT: 直接音と余韻の両方を速やかに止めて先頭へ（停止後に鳴っている余韻も止める） */
+  cut(): void {
+    if (this.ctx) this.silenceOutput()
+    this.teardownSource(this.status === 'playing' ? SILENCE_FADE_SECONDS : 0)
+    this.offset = 0
+    this.setStatus('stopped')
+    this.sendTransport()
+  }
+
+  /** ループ再生の設定。再生中に切り替えても位置と Motion の時刻は連続する */
+  setLoop(enabled: boolean, type: LoopType): void {
+    this.loopEnabled = enabled
+    this.loopType = type
+    const src = this.source?.node
+    if (!src || !this.ctx || this.status !== 'playing') return
+    const position = this.getPosition()
+    const b = this.loopBounds()
+    src.loop = !!b
+    if (b) {
+      src.loopStart = b.start
+      src.loopEnd = b.end
+    }
+    // ループ区間が変わってもメディア時刻が連続するよう、現在位置で基準を取り直す
+    this.startedAt = this.ctx.currentTime - position
+    this.sendTransport()
+    this.armLoopBoundary()
+  }
+
+  /** 現在のループ区間（ループ OFF なら null） */
+  loopRegion(): LoopRegion | null {
+    return this.loopBounds()
+  }
+
+  /** SPATIAL LOOP で使う、音楽が鳴っている区間（無音のみ・短すぎる音源なら null） */
+  getMusicRegion(): LoopRegion | null {
+    return this.region
+  }
+
+  getTailReport(): TailReport | null {
+    return this.tailReport
+  }
+
+  /** テスト用: 後期残響の畳み込みの組の数（ループで増え続けないことの確認） */
+  debugReverbSlots(): number {
+    return this.spatialGraph?.debug.reverbSlots() ?? 0
+  }
+
   seek(seconds: number): void {
     if (!this.buffer) return
     const target = Math.min(Math.max(seconds, 0), this.buffer.duration)
-    if (this.status === 'playing') {
-      this.teardownSource()
-      this.startSource(target)
+    if (this.status === 'playing' && this.ctx) {
+      // 新旧の音源を短くクロスフェード（余韻は残す）
+      this.teardownSource(SEEK_FADE_SECONDS)
+      this.startSource(target, this.ctx.currentTime, SEEK_FADE_SECONDS)
     } else {
       this.offset = target
       this.sendTransport()
@@ -267,7 +385,7 @@ export class AudioEngine {
   getPosition(): number {
     if (!this.buffer) return 0
     if (this.status !== 'playing' || !this.ctx) return this.offset
-    return Math.min(this.ctx.currentTime - this.startedAt, this.buffer.duration)
+    return Math.min(Math.max(transportTime(this.transport(), this.ctx.currentTime), 0), this.buffer.duration)
   }
 
   /** linear gain（0〜1） */
@@ -323,9 +441,51 @@ export class AudioEngine {
 
   /** 再生位置の基準。位置はメディア時刻の関数なので、これを送れば再生・一時停止・シークで同じ位置が再現される */
   private transport(): MotionTransport {
-    return this.status === 'playing'
-      ? { playing: true, startedAt: this.startedAt, pausedAt: this.offset }
-      : { playing: false, startedAt: 0, pausedAt: this.offset }
+    return this.status === 'playing' || this.source ? this.playingTransport() : { playing: false, startedAt: 0, pausedAt: this.offset }
+  }
+
+  private playingTransport(): MotionTransport {
+    const b = this.loopBounds()
+    return { playing: true, startedAt: this.startedAt, pausedAt: this.offset, loopStart: b?.start ?? 0, loopEnd: b?.end ?? 0 }
+  }
+
+  private loopBounds(): LoopRegion | null {
+    if (!this.loopEnabled || !this.buffer) return null
+    return loopBounds(this.loopType, this.region, this.buffer.duration)
+  }
+
+  /** 出力ゲートを短くフェードアウトし、その時点までの残響を消す（PAUSE / CUT） */
+  private silenceOutput(): void {
+    if (!this.ctx || !this.outputGate) return
+    this.silencedAt = silenceOutput(this.ctx, this.outputGate, this.spatialGraph)
+  }
+
+  private clearLoopTimer(): void {
+    if (this.loopTimer) clearTimeout(this.loopTimer)
+    this.loopTimer = null
+  }
+
+  /**
+   * NORMAL LOOP: 次の境界の少し前に「境界の時刻で前回の残響を消す」予約をする（AudioParam の予約なのでサンプル単位で正確）。
+   * SPATIAL LOOP は消さない（前回の余韻と次の冒頭が重なる）
+   */
+  private armLoopBoundary(): void {
+    this.clearLoopTimer()
+    const ctx = this.ctx
+    const b = this.loopBounds()
+    const src = this.source?.node
+    if (!ctx || !b || !src || this.loopType !== 'normal') return
+    if (b.end - b.start < LOOP_RESET_MIN_PERIOD_SECONDS) return
+    const boundary = nextLoopBoundary(ctx.currentTime, this.startedAt, b)
+    this.loopTimer = setTimeout(
+      () => {
+        this.loopTimer = null
+        if (this.source?.node !== src || !this.ctx) return
+        this.spatialGraph?.resetReverb(boundary, NORMAL_LOOP_RESET_FADE_SECONDS)
+        this.loopTimer = setTimeout(() => this.armLoopBoundary(), Math.max(0, boundary - this.ctx.currentTime + 0.05) * 1000)
+      },
+      Math.max(0, boundary - ctx.currentTime - LOOP_ARM_AHEAD_SECONDS) * 1000,
+    )
   }
 
   private sendTransport(): void {
@@ -367,6 +527,9 @@ export class AudioEngine {
 
   dispose(): void {
     this.teardownSource()
+    this.clearLoopTimer()
+    if (this.planTimer) clearTimeout(this.planTimer)
+    if (this.spatialPlanTimer) clearTimeout(this.spatialPlanTimer)
     this.analysisToken++
     this.statusListener = null
     this.dspListener = null
@@ -410,7 +573,11 @@ export class AudioEngine {
    */
   private requestPlan(): void {
     this.planDirty = true
-    if (!this.planning) void this.runPlan()
+    if (this.planTimer) clearTimeout(this.planTimer)
+    this.planTimer = setTimeout(() => {
+      this.planTimer = null
+      if (!this.planning) void this.runPlan()
+    }, PLAN_DEBOUNCE_MS)
   }
 
   private async runPlan(): Promise<void> {
@@ -476,7 +643,11 @@ export class AudioEngine {
 
   private requestSpatialPlan(): void {
     this.spatialDirty = true
-    if (!this.spatialPlanning) void this.runSpatialPlan()
+    if (this.spatialPlanTimer) clearTimeout(this.spatialPlanTimer)
+    this.spatialPlanTimer = setTimeout(() => {
+      this.spatialPlanTimer = null
+      if (!this.spatialPlanning) void this.runSpatialPlan()
+    }, PLAN_DEBOUNCE_MS)
   }
 
   private async runSpatialPlan(): Promise<void> {
@@ -531,37 +702,57 @@ export class AudioEngine {
     this.dspListener?.(this.dsp)
   }
 
-  private startSource(offset: number): void {
+  /** when（ctx 時刻）から offset の位置で再生を始める。fadeIn > 0 ならフェードイン（SEEK のクロスフェード） */
+  private startSource(offset: number, when: number, fadeIn: number): void {
     const ctx = this.ctx
     if (!ctx || !this.buffer || !this.graph) return
-    const src = new AudioBufferSourceNode(ctx, { buffer: this.buffer })
-    src.connect(this.graph.input)
-    src.onended = () => {
-      // 手動停止では teardownSource が onended を外すため、ここに来るのは自然終了のみ
-      if (this.source !== src) return
+    const b = this.loopBounds()
+    // SPATIAL LOOP で末尾の無音にいる場合は、ループ区間の先頭から
+    if (b && offset >= b.end) offset = b.start
+    const node = new AudioBufferSourceNode(ctx, { buffer: this.buffer, loop: !!b, loopStart: b?.start ?? 0, loopEnd: b?.end ?? 0 })
+    const gain = new GainNode(ctx, { gain: fadeIn > 0 ? 0 : 1 })
+    if (fadeIn > 0) linearRampAt(gain.gain, when, 1, when + fadeIn)
+    node.connect(gain).connect(this.graph.input)
+    node.onended = () => {
+      // 手動停止では teardownSource が onended を差し替えるため、ここに来るのは自然終了のみ（ループ中は終了しない）
+      if (this.source?.node !== node) return
       this.source = null
+      node.disconnect()
+      gain.disconnect()
+      this.clearLoopTimer()
       this.offset = 0
       this.setStatus('stopped')
       this.sendTransport()
     }
-    src.start(0, offset)
-    this.source = src
+    node.start(when, offset)
+    this.source = { node, gain }
     this.offset = offset
-    this.startedAt = ctx.currentTime - offset
-    this.spatialGraph?.setTransport({ playing: true, startedAt: this.startedAt, pausedAt: offset })
+    this.startedAt = when - offset
+    this.spatialGraph?.setTransport(this.playingTransport())
+    this.armLoopBoundary()
   }
 
-  private teardownSource(): void {
-    const src = this.source
-    if (!src) return
+  /** 音源を止める。fade > 0 なら直接音を短くフェードアウトしてから止める（クリック防止） */
+  private teardownSource(fade = 0): void {
+    const s = this.source
+    if (!s) return
     this.source = null
-    src.onended = null
+    this.clearLoopTimer()
+    const release = () => {
+      s.node.disconnect()
+      s.gain.disconnect()
+    }
+    if (fade > 0 && this.ctx) {
+      fadeOutSource(this.ctx, s.node, s.gain, fade, release)
+      return
+    }
+    s.node.onended = null
     try {
-      src.stop()
+      s.node.stop()
     } catch {
       // 既に停止済み
     }
-    src.disconnect()
+    release()
   }
 
   private setStatus(status: PlaybackStatus): void {

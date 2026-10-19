@@ -154,6 +154,25 @@ export function sourcePositions(t: number, layout: MotionLayout, ctl: MotionCont
   }
 }
 
+/**
+ * 反射音・残響への送りの左右配分（gL, gR）。LEFT / RIGHT レイヤーを現在の左右位置に振り分ける。
+ * 静止位置ではレイヤーごとに元のチャンネル（CENTER は両方、LEFT 系は L、RIGHT 系は R）に戻るため、
+ * Motion の動きが 0 なら送りは原音と一致する（全レイヤーの和 = 原音）。
+ * パン位置 p = sin(方位) / |sin(静止方位)|（−1 = 左、+1 = 右）の等パワーパン。前後の区別はしない
+ */
+export function reflectionFeedGains(source: number, azimuth: number, layout: MotionLayout): [number, number] {
+  if (source === SRC.center) return [1, 1]
+  // AMBIENCE（左右無相関の成分）は元のチャンネルのまま: 拡散した成分の反射を動かしても定位は増えず、
+  // 後方へ回り込む動き（PULSE の広がりなど）で反射だけが逆に狭まるため
+  if (source === SRC.bedL || source === SRC.ambL) return [1, 0]
+  if (source === SRC.bedR || source === SRC.ambR) return [0, 1]
+  const home = layout.lrAzimuth
+  const ref = Math.max(Math.abs(Math.sin((home * Math.PI) / 180)), Math.sin(Math.PI / 12))
+  const p = clamp(Math.sin((azimuth * Math.PI) / 180) / ref, -1, 1)
+  const a = ((p + 1) * Math.PI) / 4
+  return [Math.cos(a), Math.sin(a)]
+}
+
 export function createPositions(): SourcePosition[] {
   return Array.from({ length: SOURCE_COUNT }, () => ({ azimuth: 0, distance: REFERENCE_DISTANCE_M }))
 }

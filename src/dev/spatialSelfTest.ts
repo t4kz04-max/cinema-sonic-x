@@ -133,7 +133,8 @@ function describe(before: StereoMetrics, after: StereoMetrics): string {
   )
 }
 
-export async function runSpatialSelfTest(): Promise<TestResult[]> {
+/** includeMotion: false で空間音響プロトタイプの試験だけ（test:spatial は Motion を別のブラウザで実行する） */
+export async function runSpatialSelfTest(includeMotion = true): Promise<TestResult[]> {
   const results: TestResult[] = []
   let group = ''
   const add = (name: string, pass: boolean, detail: string) => results.push({ group, name, pass, detail })
@@ -376,6 +377,6 @@ export async function runSpatialSelfTest(): Promise<TestResult[]> {
     }
   }
 
-  results.push(...(await runMotionSelfTest()))
+  if (includeMotion) results.push(...(await runMotionSelfTest()))
   return results
 }

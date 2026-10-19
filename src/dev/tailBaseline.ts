@@ -4,6 +4,7 @@
 
 import { loadDynamicsWorklet } from '../audio/processingGraph'
 import { createSpatialGraph, loadMotionWorklet, measureHrtfLatency } from '../audio/spatial/spatialGraph'
+import { loadTailWorklet } from '../audio/spatial/tailEngine'
 import { DEFAULT_SPATIAL_PARAMS, hallSettings, type SpatialMode, type SpatialParams } from '../audio/spatial/spatialSpec'
 import type { TestResult } from './dspSelfTest'
 import { analyzeTail, energyDecayCurve, formatTail, sha256Hex, timeToLevel, type TailReport } from './tailMetrics'
@@ -28,6 +29,7 @@ export const HALL_BASELINE_CASES: BaselineCase[] = [
 export async function renderImpulse(params: SpatialParams, seconds: number, hrtfLatency: number, motion = false): Promise<AudioBuffer> {
   const ctx = new OfflineAudioContext(2, Math.round(seconds * RATE), RATE)
   await loadDynamicsWorklet(ctx)
+  await loadTailWorklet(ctx)
   if (motion) await loadMotionWorklet(ctx)
   const imp = new Float32Array(Math.round(seconds * RATE))
   imp[Math.round(IMPULSE_AT * RATE)] = 0.5
@@ -49,7 +51,7 @@ export async function renderImpulse(params: SpatialParams, seconds: number, hrtf
 }
 
 /** 音楽相当の信号が終わった後、出力が直前 1 秒の平均レベルから −60 dB に下がるまでの時間 */
-export function stopDecaySeconds(out: AudioBuffer, stopAt: number): number {
+export function stopDecaySeconds(out: { getChannelData(c: number): Float32Array }, stopAt: number): number {
   const L = out.getChannelData(0)
   const R = out.getChannelData(1)
   const s = Math.round(stopAt * RATE)
