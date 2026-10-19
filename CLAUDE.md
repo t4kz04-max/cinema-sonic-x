@@ -35,6 +35,8 @@ src/
     eqResponse.ts      UI 表示用の周波数特性
     loadAudioFile.ts   ファイル読み込み→形式判定→デコード、エラー分類
     spatial/           空間音響（spatialSpec: モード定義・説明 / spatialGraph: WIDE・CINEMA・HALL / spatialAnalysis: ラウドネス合わせと測定 / hallImpulse: 残響 IR 合成）
+    spatial/motion*.ts Dynamic Spatial Motion Engine（motion: 位置の純粋関数 / motionEnvelope: PULSE 包絡 / motionTypes）
+    worklets/motion.worklet.ts  STFT レイヤー分解・距離処理・12 方向パン
     stereoMetrics.ts   位相相関・ステレオ幅・モノラル和の測定（純粋関数）
   dev/         DSP 自己診断（tests/dsp-selftest.html から実行。本番ビルドに含まれない）
   hooks/       React と audio 層の橋渡し（useAudioPlayer）
@@ -52,6 +54,8 @@ docs/PHASES.md 開発計画
 - 音量Gainは常に最終段（モニター音量）であり、書き出し音声には影響させない。
 - 空間グラフは重低音グラフの後に直列。ORIGINAL/PROCESSED は両段を同時に BYPASS し、直列でも原音とビット一致させる。
 - 空間処理は原音とラウドネスをそろえて A/B 比較させる。HRTF の前方定位は個人差があるため、成立を前提にした表示・説明をしない。単純な左右パン・回転を「空間化」と呼ばない。
+- Motion の位置は必ず「メディア時刻とパラメーターの純粋関数」にする（乱数・壁時計を使わない）。シーク・オフライン書き出しで同じ動きを再現するため。HRTF の PannerNode は固定方向で使い、位置の自動化をしない。
+- 使っていないチェーンは入力を切り離し、休止できるワークレットは休止させる（CPU 負荷対策）。
 - Mid/Side 処理で Side に足す成分はモノラル和で消える形にする（モノラル互換性）。Side ゲインは原音の幅に応じて上限を設け、逆相が支配的にならないようにする。
 - DynamicsCompressorNode（フォールバック）は自動メイクアップゲインを持つため、必ず実測値で打ち消す。基本コンプを「リミッター」「True Peak Limiter」と表記しない。
 - AudioParam の変更は平滑化（setTargetAtTime / linearRamp）し、クリックノイズを出さない。BiquadFilter の lowpass/highpass の Q は dB 指定である点に注意。
@@ -75,6 +79,6 @@ docs/PHASES.md 開発計画
 
 - 変更後は必ず `npm run build`（型チェック + ビルド）を実行し、エラーがないことを確認する。
 - `npm run lint`（oxlint）で警告を確認する。
-- 空間処理を変更したら `npm run test:spatial` を実行し、全 PASS を確認する。
+- 空間処理を変更したら `npm run test:spatial` を実行し、全 PASS を確認する（Motion を含めて 10 分前後かかる。Motion だけなら tests/dsp-selftest.html?suite=motion）。テストはヘッドレスブラウザを起動するため、メモリに余裕があるときに 1 つずつ実行する。
 - 音声処理を変更したら `npm run test:dsp`（ヘッドレス Chrome/Edge で DSP 自己診断）を実行する。既知の FAIL（EDM相当の低域絶対値、docs/PHASES.md 参照）以外が出ないことを確認する。検証項目は `src/dev/dspSelfTest.ts` に追加し、純音だけでなく楽曲相当信号（`src/dev/testSignals.ts`）でも確認する。合格基準を結果に合わせて緩めない。
 - 実装できていない機能は報告で「未実装」と明示する。動作確認していないことを「動作する」と書かない。

@@ -1,8 +1,9 @@
 import { blockPeakPercentileDb, integratedLoudness, linearToDb, samplePeak } from '../loudness'
 import { loadDynamicsWorklet } from '../processingGraph'
 import { monoColorationDb, stereoColorationDb, stereoMetrics, type StereoMetrics } from '../stereoMetrics'
-import { createSpatialGraph } from './spatialGraph'
-import { wideSideCapDb, type ActiveSpatialMode, type SpatialParams } from './spatialSpec'
+import type { Envelope } from './motion'
+import { createSpatialGraph, loadMotionWorklet } from './spatialGraph'
+import { isMotionActive, wideSideCapDb, type ActiveSpatialMode, type SpatialParams } from './spatialSpec'
 
 /** 原音の中高域の幅から WIDE の Side ゲイン上限を決める */
 export function wideCapFor(before: StereoMetrics | null): number {
@@ -70,6 +71,8 @@ export interface SpatialPlan {
 export interface SpatialPlanOptions {
   useWorklet: boolean
   hrtfLatencySeconds: number
+  /** PULSE 用の包絡（Motion ON 時） */
+  envelope?: Envelope | null
 }
 
 async function renderSpatial(
@@ -82,15 +85,18 @@ async function renderSpatial(
 ) {
   return render(excerpt, async (ctx, src) => {
     if (opts.useWorklet && !(await loadDynamicsWorklet(ctx))) throw new Error('解析用 AudioWorklet を読み込めませんでした')
+    // Motion ON なら Motion チェーンだけを作る（抜粋の先頭をメディア時刻 0 として動きを再現）
+    const motion = isMotionActive(params) && (await loadMotionWorklet(ctx))
     const g = createSpatialGraph(ctx, {
       params,
       bypass: false,
       trimDb,
       useWorklet: opts.useWorklet,
       hrtfLatencySeconds: opts.hrtfLatencySeconds,
-      modes: [params.mode],
+      modes: motion ? [] : [params.mode],
       limiterEnabled,
       wideSideCapDb,
+      motion: motion ? { envelope: opts.envelope ?? null } : undefined,
     })
     src.connect(g.input)
     return g.output

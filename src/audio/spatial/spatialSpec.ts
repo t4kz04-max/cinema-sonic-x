@@ -1,6 +1,8 @@
 // 空間音響プロトタイプのモード定義と、UI パラメーター（0〜100）→ DSP 値の対応。
 // 各モードで 4 つのパラメーターが何を変えるかを、UI に表示する説明文と一緒にここで定義する。
 
+import type { MotionControl, MotionLayout, MotionPreset } from './motion'
+
 export type SpatialMode = 'off' | 'wide' | 'cinema' | 'hall'
 export type ActiveSpatialMode = Exclude<SpatialMode, 'off'>
 
@@ -12,6 +14,13 @@ export interface SpatialParams {
   depth: number
   /** 100 = 処理音のみ、0 = 原音のみ */
   wetDry: number
+  /** Dynamic Spatial Motion Engine（CINEMA / HALL で有効） */
+  motionEnabled: boolean
+  motionPreset: MotionPreset
+  /** 以下 0〜100 */
+  motionSpeed: number
+  motionDepth: number
+  centerLock: number
 }
 
 export const DEFAULT_SPATIAL_PARAMS: SpatialParams = {
@@ -20,6 +29,11 @@ export const DEFAULT_SPATIAL_PARAMS: SpatialParams = {
   roomSize: 50,
   depth: 40,
   wetDry: 100,
+  motionEnabled: false,
+  motionPreset: 'cinematic',
+  motionSpeed: 40,
+  motionDepth: 60,
+  centerLock: 80,
 }
 
 const u = (v: number) => Math.min(Math.max(v / 100, 0), 1)
@@ -247,3 +261,78 @@ export const MODE_DOCS: Record<ActiveSpatialMode, ModeDoc> = {
     ],
   },
 }
+
+
+// ---------------- MOTION ----------------
+
+/** Motion Engine を使えるモード */
+export function motionSupported(mode: SpatialMode): mode is 'cinema' | 'hall' {
+  return mode === 'cinema' || mode === 'hall'
+}
+
+export function isMotionActive(p: SpatialParams): boolean {
+  return p.motionEnabled && motionSupported(p.mode)
+}
+
+/** モードの静止配置（Motion の基準位置）。CINEMA は仮想スピーカーの角度・距離をそのまま使う */
+export function motionLayout(p: SpatialParams): MotionLayout {
+  if (p.mode === 'hall') {
+    return { lrAzimuth: 30, ambienceAzimuth: 120, baseDistance: lerp(1.5, 4.5, u(p.depth)) }
+  }
+  const c = cinemaSettings(p)
+  return { lrAzimuth: c.speakerAngleDeg, ambienceAzimuth: 110, baseDistance: c.distanceM }
+}
+
+export function motionControl(p: SpatialParams): MotionControl {
+  return {
+    enabled: isMotionActive(p),
+    preset: p.motionPreset,
+    speed: u(p.motionSpeed),
+    depth: u(p.motionDepth),
+    centerLock: u(p.centerLock),
+  }
+}
+
+export const MOTION_PRESET_DOCS: Record<MotionPreset, { label: string; summary: string; detail: string }> = {
+  cinematic: {
+    label: 'CINEMATIC MOTION',
+    summary: '中央を保ったまま、周辺の音がゆっくり漂う',
+    detail: 'LEFT/RIGHT が外側・前後にそれぞれ独立した位相でゆっくり揺れ、AMBIENCE が側方〜後方で漂う。距離もわずかに変化',
+  },
+  orbit: {
+    label: 'ORBIT',
+    summary: '空間成分がリスナーの周囲を回る',
+    detail: 'AMBIENCE（左右無相関の成分）が 180° 離れて聴取者の周囲を一周。LEFT/RIGHT はそれぞれの側で前方〜後方へ回り込む。曲全体の一括回転ではない',
+  },
+  sweep: {
+    label: 'SWEEP',
+    summary: '音が左右を横断する',
+    detail: 'LEFT と RIGHT が左右を横断（位相を 90° ずらし、同時に中央で重ならない）。AMBIENCE は固定',
+  },
+  pulse: {
+    label: 'PULSE',
+    summary: '音楽の強弱で広がりと距離が変わる',
+    detail: '曲全体から事前計算したエネルギー包絡（10 ms ごと、アタック 80 ms・リリースは SPEED で 0.15〜0.8 秒）で、大きいほど広く近く、小さいほど狭く遠くなる',
+  },
+}
+
+export const MOTION_PARAM_DOCS = {
+  motionSpeed: '動きの基本周期 40 秒（0%）〜 5 秒（100%）。PULSE では包絡の追従速度',
+  motionDepth: '移動範囲（方位と距離の変化幅）',
+  centerLock: '中央成分の抽出強度。100% でボーカルなど中央の音を前方に固定、0% では中央の音も左右レイヤーと一緒に動く',
+} as const
+
+export const MOTION_PROCESSING = [
+  'L/R を STFT（2048 点・50% オーバーラップ）で帯域ごとに分解し、相関・左右のレベル差・位相から CENTER / LEFT / RIGHT / AMBIENCE に振り分ける（200 Hz 以下は BED として固定）。全レイヤーの和は原音と一致',
+  'CENTER と BED（低域）は前方・固定。LEFT / RIGHT / AMBIENCE だけがプリセットに従って独立に動く',
+  '位置は再生時刻の関数（乱数なし）。シーク・一時停止・オフライン書き出しでも同じ動きを再現する',
+  '各レイヤーに距離処理（逆距離ゲイン・空気吸収ローパス・伝搬遅延）を掛け、30° 間隔 12 方向の固定 HRTF 仮想スピーカーへ等パワーパンで配置（HRTF 自体は動かさないため切替ノイズが出ない）',
+  '反射音・残響は原音から作るため、距離が変わると直接音と残響の比率・到達時間差が変わる',
+]
+
+export const MOTION_CAVEATS = [
+  '通常のステレオ音源から個々の楽器は分離できない。レイヤーは「中央にある音・左寄りの音・右寄りの音・左右無相関の音」という統計的な分類で、同じ楽器が複数のレイヤーにまたがる',
+  'STFT 分解の遅延 約 43 ms（48 kHz）。ORIGINAL/PROCESSED 切替時にこの分だけ時間がずれる',
+  'HALL でも Motion ON の直接音は HRTF で描画されるため、ヘッドホン再生が前提',
+  'SPEED/プリセット変更時は位置が新しい軌道へ 0.15 秒の平滑化で移る',
+]

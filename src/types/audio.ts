@@ -60,6 +60,8 @@ export interface SpatialStatus {
   stereoColorationDb: number | null
   predictedLimiterGrDb: number | null
   hrtfLatencyMs: number | null
+  /** Motion Engine（AudioWorklet）が使えるか */
+  motionAvailable: boolean
 }
 
 export interface DspMeters {

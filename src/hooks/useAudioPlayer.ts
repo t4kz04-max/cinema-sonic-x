@@ -167,6 +167,8 @@ export function useAudioPlayer() {
     [getEngine],
   )
 
+  const readMotion = useCallback(() => engineRef.current?.getMotionReport() ?? null, [])
+
   const readScope = useCallback(
     (left: Float32Array<ArrayBuffer>, right: Float32Array<ArrayBuffer>) => engineRef.current?.readScope(left, right) ?? false,
     [],
@@ -206,6 +208,7 @@ export function useAudioPlayer() {
     spatialParams,
     setSpatialParams,
     readScope,
+    readMotion,
     dsp,
     meters,
   }

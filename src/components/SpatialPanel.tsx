@@ -1,7 +1,14 @@
+import { motionPeriodSeconds, type MotionPreset } from '../audio/spatial/motion'
 import {
   cinemaSettings,
   hallSettings,
+  isMotionActive,
   MODE_DOCS,
+  MOTION_CAVEATS,
+  MOTION_PARAM_DOCS,
+  MOTION_PRESET_DOCS,
+  MOTION_PROCESSING,
+  motionSupported,
   wideSettings,
   type ActiveSpatialMode,
   type SpatialMode,
@@ -13,6 +20,7 @@ import type { AudioPlayer } from '../hooks/useAudioPlayer'
 import type { SpatialStatus } from '../types/audio'
 import { Badge, Panel } from './Panel'
 import { RangeControl } from './RangeControl'
+import { SpatialVisualizer } from './SpatialVisualizer'
 import { Vectorscope } from './Vectorscope'
 
 interface SpatialPanelProps {
@@ -64,6 +72,121 @@ function derived(mode: ActiveSpatialMode, p: SpatialParams, s: SpatialStatus): R
     depth: `直接音 ${signed(h.directGainDb)} dB`,
     wetDry: wet,
   }
+}
+
+/** SPEED の現在値（基本周期）。PULSE では包絡の追従速度 */
+function motionPeriodLabel(p: SpatialParams): string {
+  return p.motionPreset === 'pulse' ? `追従 リリース ${(0.8 * Math.pow(0.15 / 0.8, p.motionSpeed / 100)).toFixed(2)} 秒` : `周期 ${motionPeriodSeconds(p.motionSpeed / 100).toFixed(1)} 秒`
+}
+
+const PRESETS: MotionPreset[] = ['cinematic', 'orbit', 'sweep', 'pulse']
+
+const MOTION_SLIDERS: { key: 'motionSpeed' | 'motionDepth' | 'centerLock'; label: string }[] = [
+  { key: 'motionSpeed', label: 'MOTION SPEED' },
+  { key: 'motionDepth', label: 'MOTION DEPTH' },
+  { key: 'centerLock', label: 'CENTER LOCK' },
+]
+
+function MotionBlock({ player }: SpatialPanelProps) {
+  const { spatialParams: p, dsp, status } = player
+  const supported = motionSupported(p.mode)
+  const available = dsp?.spatial.motionAvailable ?? true
+  const active = isMotionActive(p)
+  const usable = supported && available
+  return (
+    <div className={`motion-block${active ? ' is-active' : ''}`}>
+      <div className="motion-block__head">
+        <div>
+          <p className="motion-block__title">DYNAMIC SPATIAL MOTION</p>
+          <p className="motion-block__sub">
+            {!available
+              ? 'このブラウザ環境では AudioWorklet が使えないため利用できません（https または localhost で開いてください）'
+              : supported
+                ? '中央を前方に保ち、左右・空間成分を独立して動かす（ヘッドホン推奨）'
+                : 'Motion は CINEMA / HALL で使用できます'}
+          </p>
+        </div>
+        <button
+          type="button"
+          className={`bypass-btn engine-btn${p.motionEnabled ? ' is-enabled' : ''}`}
+          aria-pressed={p.motionEnabled}
+          disabled={!usable}
+          onClick={() => player.setSpatialParams({ motionEnabled: !p.motionEnabled })}
+        >
+          <span className="bypass-btn__led" aria-hidden="true" />
+          <span className="bypass-btn__label">MOTION</span>
+          <span className="bypass-btn__state">{p.motionEnabled ? 'ON' : 'OFF（既存の空間処理）'}</span>
+        </button>
+      </div>
+
+      <div className="motion-presets" role="radiogroup" aria-label="MOTION PRESET">
+        {PRESETS.map((id) => (
+          <button
+            key={id}
+            type="button"
+            role="radio"
+            aria-checked={p.motionPreset === id}
+            disabled={!usable}
+            className={`spatial-mode motion-preset${p.motionPreset === id ? ' is-active' : ''}`}
+            onClick={() => player.setSpatialParams({ motionPreset: id })}
+          >
+            <span className="spatial-mode__label">{MOTION_PRESET_DOCS[id].label}</span>
+            <small>{MOTION_PRESET_DOCS[id].summary}</small>
+          </button>
+        ))}
+      </div>
+
+      <div className="motion-grid">
+        <div className="motion-controls">
+          {MOTION_SLIDERS.map(({ key, label }) => (
+            <div className={`spatial-param${!usable || !p.motionEnabled ? ' is-disabled' : ''}`} key={key}>
+              <div className="spatial-param__head">
+                <label htmlFor={`mo-${key}`}>{label}</label>
+                <span className="mono">{p[key]}%</span>
+              </div>
+              <RangeControl
+                id={`mo-${key}`}
+                min={0}
+                max={100}
+                step={1}
+                value={p[key]}
+                disabled={!usable}
+                ariaLabel={label}
+                onChange={(v) => player.setSpatialParams({ [key]: v } as Partial<SpatialParams>)}
+              />
+              <p className="spatial-param__desc">
+                {MOTION_PARAM_DOCS[key]}
+                {key === 'motionSpeed' && <span className="mono"> → {motionPeriodLabel(p)}</span>}
+              </p>
+            </div>
+          ))}
+          <p className="spatial-param__desc motion-preset-detail">
+            <strong>{MOTION_PRESET_DOCS[p.motionPreset].label}:</strong> {MOTION_PRESET_DOCS[p.motionPreset].detail}
+          </p>
+        </div>
+        <SpatialVisualizer params={p} readMotion={player.readMotion} playing={status === 'playing'} />
+      </div>
+
+      <div className="spatial-doc">
+        <div>
+          <p className="spatial-doc__title">Motion の処理内容</p>
+          <ol>
+            {MOTION_PROCESSING.map((t) => (
+              <li key={t}>{t}</li>
+            ))}
+          </ol>
+        </div>
+        <div>
+          <p className="spatial-doc__title">Motion の既知の制限</p>
+          <ul>
+            {MOTION_CAVEATS.map((t) => (
+              <li key={t}>{t}</li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 function MetricsTable({ before, after, status }: { before: StereoMetrics | null; after: StereoMetrics | null; status: SpatialStatus }) {
@@ -195,6 +318,8 @@ export function SpatialPanel({ player }: SpatialPanelProps) {
           <Vectorscope read={player.readScope} active={playStatus === 'playing'} />
         </div>
       </div>
+
+      <MotionBlock player={player} />
 
       {doc && (
         <div className="spatial-doc">

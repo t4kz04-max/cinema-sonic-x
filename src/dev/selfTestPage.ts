@@ -1,9 +1,11 @@
 import { runDspSelfTest } from './dspSelfTest'
+import { runMotionSelfTest } from './motionSelfTest'
 import { runSpatialSelfTest } from './spatialSelfTest'
 
 const out = document.getElementById('out')!
 out.textContent = '実行中…'
-const suite = new URLSearchParams(location.search).get('suite') === 'spatial' ? runSpatialSelfTest : runDspSelfTest
+const suiteName = new URLSearchParams(location.search).get('suite')
+const suite = suiteName === 'spatial' ? runSpatialSelfTest : suiteName === 'motion' ? runMotionSelfTest : runDspSelfTest
 suite()
   .then((results) => {
     const failed = results.filter((r) => !r.pass).length

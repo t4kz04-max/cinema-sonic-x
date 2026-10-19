@@ -4,7 +4,10 @@ import { DEFAULT_BASS_PARAMS, type BassParams } from './bassSpec'
 import { eqCapScale } from './biquadMath'
 import { linearToDb } from './loudness'
 import { analyzeSpatialSource, buildSpatialExcerpt, planSpatial, wideCapFor } from './spatial/spatialAnalysis'
-import { createSpatialGraph, measureHrtfLatency, type SpatialGraph } from './spatial/spatialGraph'
+import type { Envelope } from './spatial/motion'
+import { computeEnvelope } from './spatial/motionEnvelope'
+import type { MotionReport, MotionTransport } from './spatial/motionTypes'
+import { createSpatialGraph, loadMotionWorklet, measureHrtfLatency, type SpatialGraph } from './spatial/spatialGraph'
 import { DEFAULT_SPATIAL_PARAMS, type SpatialParams } from './spatial/spatialSpec'
 import type { StereoMetrics } from './stereoMetrics'
 import {
@@ -50,8 +53,12 @@ const INITIAL_DSP_STATUS: DspStatus = {
     stereoColorationDb: null,
     predictedLimiterGrDb: null,
     hrtfLatencyMs: null,
+    motionAvailable: false,
   },
 }
+
+/** Motion の位置レポート間隔（可視化用） */
+const MOTION_REPORT_MS = 33
 
 /** ベクトルスコープ用 AnalyserNode のサイズ */
 const SCOPE_FFT_SIZE = 2048
@@ -96,6 +103,9 @@ export class AudioEngine {
   private spatialBefore: StereoMetrics | null = null
   private spatialPlanning = false
   private spatialDirty = false
+  /** PULSE 用のエネルギー包絡（曲全体から計算） */
+  private envelope: Envelope | null = null
+  private motionReport: MotionReport | null = null
   private dsp: DspStatus = { ...INITIAL_DSP_STATUS }
   private dspListener: ((status: DspStatus) => void) | null = null
   private meters: DspMeters = { bassGrDb: 0, limiterGrDb: 0, spatialLimiterGrDb: 0 }
@@ -161,6 +171,7 @@ export class AudioEngine {
     })
 
     this.hrtfLatency = await measureHrtfLatency(ctx.sampleRate)
+    const motionOk = await loadMotionWorklet(ctx)
     const spatial = createSpatialGraph(ctx, {
       params: this.spatialParams,
       bypass: this.spatialBypassed(),
@@ -169,6 +180,10 @@ export class AudioEngine {
       hrtfLatencySeconds: this.hrtfLatency,
       wideSideCapDb: wideCapFor(this.spatialBefore),
       reportIntervalMs: METER_INTERVAL_MS,
+      motion: motionOk ? { transport: this.transport(), envelope: this.envelope, reportIntervalMs: MOTION_REPORT_MS } : undefined,
+    })
+    spatial.onMotionReport((r) => {
+      this.motionReport = r
     })
     spatial.onMeter((m) => {
       this.meters = { ...this.meters, spatialLimiterGrDb: m.limiterGrDb }
@@ -191,7 +206,7 @@ export class AudioEngine {
     this.scope = { left, right }
     this.updateDsp({
       dynamicsEngine: graph.engine,
-      spatial: { ...this.dsp.spatial, hrtfLatencyMs: this.hrtfLatency * 1000 },
+      spatial: { ...this.dsp.spatial, hrtfLatencyMs: this.hrtfLatency * 1000, motionAvailable: spatial.motionAvailable },
     })
     return ctx
   }
@@ -207,6 +222,8 @@ export class AudioEngine {
     this.buffer = buffer
     this.offset = 0
     this.setStatus('stopped')
+    this.updateEnvelope()
+    this.sendTransport()
     void this.startAnalysis(buffer)
   }
 
@@ -225,12 +242,14 @@ export class AudioEngine {
     this.offset = this.getPosition()
     this.teardownSource()
     this.setStatus('paused')
+    this.sendTransport()
   }
 
   stop(): void {
     this.teardownSource()
     this.offset = 0
     this.setStatus('stopped')
+    this.sendTransport()
   }
 
   seek(seconds: number): void {
@@ -241,6 +260,7 @@ export class AudioEngine {
       this.startSource(target)
     } else {
       this.offset = target
+      this.sendTransport()
     }
   }
 
@@ -287,10 +307,36 @@ export class AudioEngine {
 
   setSpatialParams(params: SpatialParams): void {
     const modeChanged = params.mode !== this.spatialParams.mode
+    const speedChanged = params.motionSpeed !== this.spatialParams.motionSpeed
     this.spatialParams = { ...params }
+    // PULSE の包絡は SPEED（追従速度）に依存するため、変わったら曲全体から再計算する
+    if (speedChanged) this.updateEnvelope()
     this.spatialGraph?.setParams(this.spatialParams, true)
     if (modeChanged) this.applyBypass()
     this.requestSpatialPlan()
+  }
+
+  /** Motion Engine が実際に使っている位置（直近のレポート）。Motion OFF・未初期化なら null */
+  getMotionReport(): MotionReport | null {
+    return this.motionReport
+  }
+
+  /** 再生位置の基準。位置はメディア時刻の関数なので、これを送れば再生・一時停止・シークで同じ位置が再現される */
+  private transport(): MotionTransport {
+    return this.status === 'playing'
+      ? { playing: true, startedAt: this.startedAt, pausedAt: this.offset }
+      : { playing: false, startedAt: 0, pausedAt: this.offset }
+  }
+
+  private sendTransport(): void {
+    this.spatialGraph?.setTransport(this.transport())
+  }
+
+  private updateEnvelope(): void {
+    if (!this.buffer) return
+    const channels = Array.from({ length: this.buffer.numberOfChannels }, (_, c) => this.buffer!.getChannelData(c))
+    this.envelope = computeEnvelope(channels, this.buffer.sampleRate, this.spatialParams.motionSpeed / 100)
+    this.spatialGraph?.setEnvelope(this.envelope)
   }
 
   /** ベクトルスコープ用の直近の L/R 波形（長さ SCOPE_FFT_SIZE）。未初期化なら false */
@@ -450,7 +496,11 @@ export class AudioEngine {
         this.updateSpatial({ analysis: 'measuring' })
         let plan
         try {
-          plan = await planSpatial(excerpt, before, params, { useWorklet: this.useWorklet, hrtfLatencySeconds: this.hrtfLatency })
+          plan = await planSpatial(excerpt, before, params, {
+            useWorklet: this.useWorklet,
+            hrtfLatencySeconds: this.hrtfLatency,
+            envelope: this.envelope,
+          })
         } catch {
           if (token === this.analysisToken) this.updateSpatial({ analysis: 'error' })
           continue
@@ -492,11 +542,13 @@ export class AudioEngine {
       this.source = null
       this.offset = 0
       this.setStatus('stopped')
+      this.sendTransport()
     }
     src.start(0, offset)
     this.source = src
     this.offset = offset
     this.startedAt = ctx.currentTime - offset
+    this.spatialGraph?.setTransport({ playing: true, startedAt: this.startedAt, pausedAt: offset })
   }
 
   private teardownSource(): void {

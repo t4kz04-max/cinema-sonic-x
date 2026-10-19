@@ -1541,3 +1541,117 @@
 }
 
 .metrics__table td { color: var(--text-strong); }
+
+/* ===== Dynamic Spatial Motion ===== */
+.motion-block {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  border-radius: 14px;
+  border: 1px solid var(--line-strong);
+  background: linear-gradient(180deg, rgba(14, 116, 144, 0.08), rgba(7, 10, 20, 0.6));
+}
+
+.motion-block.is-active {
+  border-color: rgba(56, 189, 248, 0.55);
+  box-shadow: 0 0 24px rgba(56, 189, 248, 0.1);
+}
+
+.motion-block__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.motion-block__title {
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  font-size: 13px;
+  color: #7dd3fc;
+}
+
+.motion-block__sub {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.motion-presets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@media (max-width: 1280px) {
+  .motion-presets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.spatial-mode:disabled,
+.bypass-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.motion-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: start;
+}
+
+@media (max-width: 1280px) {
+  .motion-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+.motion-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.motion-preset-detail {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--inset);
+}
+
+.viz {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--inset);
+  width: 286px;
+}
+
+.viz canvas {
+  display: block;
+  border-radius: 8px;
+}
+
+.viz__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.viz__legend li::before {
+  content: '●';
+  margin-right: 4px;
+}
+
+.viz__note {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  line-height: 1.45;
+}

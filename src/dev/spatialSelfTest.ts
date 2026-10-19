@@ -8,6 +8,7 @@ import { createSpatialGraph, measureHrtfLatency } from '../audio/spatial/spatial
 import { DEFAULT_SPATIAL_PARAMS, hallSettings, MODE_DOCS, type ActiveSpatialMode, type SpatialParams } from '../audio/spatial/spatialSpec'
 import { monoColorationDb, stereoColorationDb, stereoMetrics, type StereoMetrics } from '../audio/stereoMetrics'
 import type { TestResult } from './dspSelfTest'
+import { runMotionSelfTest } from './motionSelfTest'
 import { programMono, programPop, programStereoMix, silence, TEST_RATE, toBuffer } from './testSignals'
 
 const RATE = TEST_RATE
@@ -375,5 +376,6 @@ export async function runSpatialSelfTest(): Promise<TestResult[]> {
     }
   }
 
+  results.push(...(await runMotionSelfTest()))
   return results
 }

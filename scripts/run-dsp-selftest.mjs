@@ -74,7 +74,7 @@ try {
     (await send('Runtime.evaluate', { expression, returnByValue: true })).result?.result?.value
 
   await send('Page.navigate', { url: pageUrl })
-  const deadline = Date.now() + 600_000
+  const deadline = Date.now() + 1_800_000 // test:spatial は Motion の検証を含めて 10 分前後かかる
   let done = false
   while (!done && Date.now() < deadline) {
     await sleep(500)
