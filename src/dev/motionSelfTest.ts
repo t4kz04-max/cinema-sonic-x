@@ -619,6 +619,20 @@ export async function runMotionSelfTest(): Promise<TestResult[]> {
     }
   }
 
+  results.push(...(await runMotionCpuTest()))
+
+  return results
+}
+
+/** 19. CPU 負荷だけを実行する（?suite=cpu。重い試験を避けて負荷だけを再測定するため） */
+export async function runMotionCpuTest(): Promise<TestResult[]> {
+  const results: TestResult[] = []
+  let group = ''
+  const check = (name: string, pass: boolean, detail: string) => {
+    results.push({ group, name, pass, detail })
+    console.info(`${pass ? 'PASS' : 'FAIL'} ${group} / ${name} :: ${detail}`)
+  }
+  if (!hrtfLatency) hrtfLatency = await measureHrtfLatency(RATE)
   group = '19. CPU 負荷（オフラインレンダリング速度、10 秒のステレオ、ウォームアップ後 3 回の中央値）'
   {
     const mix = programStereoMix(10)

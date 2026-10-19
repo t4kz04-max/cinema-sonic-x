@@ -1,11 +1,13 @@
-import { runDspSelfTest } from './dspSelfTest'
-import { runMotionSelfTest } from './motionSelfTest'
+import { runDspSelfTest, type TestResult } from './dspSelfTest'
+import { runMotionCpuTest, runMotionSelfTest } from './motionSelfTest'
 import { runSpatialSelfTest } from './spatialSelfTest'
+import { runTailBaseline } from './tailBaseline'
 
 const out = document.getElementById('out')!
 out.textContent = '実行中…'
 const suiteName = new URLSearchParams(location.search).get('suite')
-const suite = suiteName === 'spatial' ? runSpatialSelfTest : suiteName === 'motion' ? runMotionSelfTest : runDspSelfTest
+const SUITES: Record<string, () => Promise<TestResult[]>> = { spatial: runSpatialSelfTest, motion: runMotionSelfTest, cpu: runMotionCpuTest, baseline: runTailBaseline }
+const suite = (suiteName && SUITES[suiteName]) || runDspSelfTest
 suite()
   .then((results) => {
     const failed = results.filter((r) => !r.pass).length
