@@ -3,6 +3,7 @@
 //         npm run test:spatial        （空間音響プロトタイプ ＋ Motion。スイートごとにブラウザを起動し直す）
 //         npm run test:tail           （Phase 04: Spatial Tail / Loop / STOP・PAUSE・CUT。4 つに分けて実行）
 //         npm run test:preset         （Phase 05: プリセット / A/B 比較 / CUSTOM / 解析の最適化。13 に分けて実行）
+//         npm run test:export         （Phase 06: 書き出し / WAV / リアルタイムとの一致 / メモリ / キャンセル）
 //         node scripts/run-dsp-selftest.mjs --suite=cpu   （個別スイート。--log で途中経過を表示）
 //         node scripts/run-dsp-selftest.mjs --suite=tail --query=groups=26-32   （一部のグループだけ）
 //         CSX_BROWSER=<実行ファイル> npm run test:dsp
@@ -61,7 +62,18 @@ const suites = named
             'preset&groups=51-51',
             'presetcpu',
           ]
-        : ['']
+        : process.argv.includes('--export')
+          ? [
+              'export&groups=60-62',
+              'export&groups=63-64',
+              'export&groups=65-65&cases=0,1,2,3',
+              'export&groups=65-65&cases=4,5,6,7',
+              'export&groups=66-66',
+              'export&groups=67-67',
+              'export&groups=68-68',
+              'export&groups=69-71',
+            ]
+          : ['']
 const MIN_FREE_MB = Number(process.env.CSX_MIN_FREE_MB ?? 400)
 
 const server = await createServer({ logLevel: 'error', server: { port: 5199, strictPort: false } })

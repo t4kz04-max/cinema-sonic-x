@@ -1,5 +1,6 @@
 import { runDspSelfTest, type TestResult } from './dspSelfTest'
 import { runMotionCpuTest, runMotionSelfTest } from './motionSelfTest'
+import { runExportSelfTest } from './exportSelfTest'
 import { runPresetCpuTest, runPresetSelfTest } from './presetSelfTest'
 import { runSpatialSelfTest } from './spatialSelfTest'
 import { runTailBaseline } from './tailBaseline'
@@ -18,6 +19,7 @@ const SUITES: Record<string, () => Promise<TestResult[]>> = {
   tailcpu: runTailCpuTest,
   preset: runPresetSelfTest,
   presetcpu: runPresetCpuTest,
+  export: runExportSelfTest,
 }
 const suite = (suiteName && SUITES[suiteName]) || runDspSelfTest
 suite()

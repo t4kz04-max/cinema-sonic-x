@@ -41,11 +41,14 @@ export function createAlignDelay(ctx: BaseAudioContext, seconds: number): AlignD
   const toFrames = (s: number) => Math.max(0, Math.round(s * ctx.sampleRate))
   let active = toFrames(seconds)
   let pending: { frames: number; at: number } | null = null
+  // 出力は常に 2ch（入力が無音・切断で 0〜1ch になっても、遅延線に残っている音を最後まで出す。
+  // 出力のチャンネル数が入力に追従すると、音源の終わりで右チャンネルの残り（遅延分）が失われていた）
   const node = new AudioWorkletNode(ctx, 'csx-align', {
     numberOfInputs: 1,
     numberOfOutputs: 1,
+    outputChannelCount: [2],
     channelCount: 2,
-    channelCountMode: 'max',
+    channelCountMode: 'explicit',
     channelInterpretation: 'speakers',
     parameterData: { delay: active },
   })

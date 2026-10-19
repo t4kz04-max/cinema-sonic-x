@@ -540,6 +540,16 @@ export async function runPresetSelfTest(): Promise<TestResult[]> {
       }
       engine.setBypass(false)
       const steps = pos.slice(1).map((v, i) => v - pos[i] - (wall[i + 1] - wall[i]))
+      // 参考: 切り替えずに同じ測り方をしたときの揺れ（AudioContext の時刻の進み方の粗さ・負荷による）
+      const pos2: number[] = []
+      const wall2: number[] = []
+      for (let k = 0; k < 8; k++) {
+        await sleep(300)
+        pos2.push(engine.getPosition())
+        wall2.push(performance.now() / 1000)
+      }
+      const base = pos2.slice(1).map((v, i) => v - pos2[i] - (wall2[i + 1] - wall2[i]))
+      info('参考: 切り替えずに同じ測り方をした場合の経過時間との差', `${base.map((d) => (d * 1000).toFixed(0)).join(' / ')} ms`)
       check('実時間: ORIGINAL ⇄ PROCESSED を 8 回切り替えても再生位置が連続（経過時間との差 ≤ 50 ms）', steps.every((d) => Math.abs(d) <= 0.05), `差 ${steps.map((d) => (d * 1000).toFixed(0)).join(' / ')} ms`)
     } finally {
       engine.dispose()

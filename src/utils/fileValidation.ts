@@ -7,9 +7,19 @@ import { formatBytes } from './format'
  */
 export const MAX_FILE_BYTES = 300 * 1024 * 1024
 
-export const ACCEPT_ATTR = '.mp3,.wav,audio/mpeg,audio/wav,audio/x-wav,audio/wave'
+export const ACCEPT_ATTR = '.mp3,.wav,.wave,.flac,.ogg,.oga,.opus,.m4a,.aac,.mp4,.webm,audio/*'
 
+/** 対応形式（自己診断・実アプリで確認） */
 const SUPPORTED_EXTENSIONS = ['mp3', 'wav', 'wave']
+/** ブラウザのデコーダーが対応していれば読み込める形式（ブラウザ・コーデックにより失敗する場合がある） */
+const BROWSER_EXTENSIONS = ['flac', 'ogg', 'oga', 'opus', 'm4a', 'aac', 'mp4', 'webm']
+
+/** 形式ごとの対応状況（UI 表示用） */
+export const FORMAT_SUPPORT: { formats: string; status: string }[] = [
+  { formats: 'WAV（PCM 16/24/32-bit・float）', status: '対応' },
+  { formats: 'MP3', status: '対応（ブラウザのデコーダー）' },
+  { formats: 'FLAC / Ogg（Vorbis・Opus）/ M4A（AAC）/ WebM', status: 'ブラウザが対応していれば読み込み可（未検証の形式あり。失敗時はエラー表示）' },
+]
 
 function extensionOf(name: string): string {
   const dot = name.lastIndexOf('.')
@@ -18,10 +28,11 @@ function extensionOf(name: string): string {
 
 /** 読み込み前に判定できるエラー（拡張子・サイズ）を検査する */
 export function precheckFile(file: File): LoadError | null {
-  if (!SUPPORTED_EXTENSIONS.includes(extensionOf(file.name))) {
+  const ext = extensionOf(file.name)
+  if (!SUPPORTED_EXTENSIONS.includes(ext) && !BROWSER_EXTENSIONS.includes(ext)) {
     return {
       kind: 'unsupported',
-      message: '非対応のファイル形式です。MP3 または WAV ファイルを選択してください。',
+      message: '非対応のファイル形式です。WAV または MP3 ファイルを選択してください（FLAC・Ogg・M4A・WebM はブラウザが対応していれば読み込めます）。',
       detail: `選択されたファイル: ${file.name}`,
     }
   }

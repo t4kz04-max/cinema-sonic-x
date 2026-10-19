@@ -45,6 +45,8 @@ src/
     outputChain.ts     重低音グラフ → 空間グラフのチェーン構築（再生・オフラインで共通）
     alignDelay.ts / worklets/align.worklet.ts  ORIGINAL/PROCESSED 比較の時刻合わせ（整数サンプル遅延）
     planCache.ts / analysisStats.ts  処理計画のキャッシュ・解析用文脈の作成回数
+    export/            Phase 06 の書き出し（exportSpec: 余韻の長さ・メモリの見積もり・型 / renderExport: createOutputChain でのオフラインレンダリング /
+                       wavEncoder: WAV（16-bit TPDF ディザ・24-bit）/ exportRunner + exportFrame: 使い捨て iframe での実行・キャンセル）
     loopRegion.ts      ループ区間（SPATIAL LOOP は音楽が鳴っている区間）
     stereoMetrics.ts   位相相関・ステレオ幅・モノラル和の測定（純粋関数）
   dev/         DSP 自己診断（tests/dsp-selftest.html から実行。本番ビルドに含まれない）
@@ -61,6 +63,11 @@ docs/PHASES.md 開発計画
 - リミッターは先読み付きのサンプルピークリミッター。True Peak とは表記しない。
 - Phase 03 の倍音生成は EQ の後・クロスオーバーの前に挿入し、処理計画（analysis.ts の planProcessing）の計測にも含める。
 - 音量Gainは常に最終段（モニター音量）であり、書き出し音声には影響させない。
+- 書き出しは再生と同じ createOutputChain・同じ処理計画（AudioEngine.exportSnapshot）で行い、書き出し専用の DSP を作らない。Motion は時刻 0 から再生する transport で描画する（シーク・プレビューの履歴に依存させない）。
+- 書き出しは使い捨ての iframe（export-frame.html）で行い、終わったら（キャンセルも）iframe ごと削除する（Chrome が AudioWorklet を読み込んだ OfflineAudioContext を解放しないため）。ページ内で書き出し用の OfflineAudioContext を作らない。
+- 書き出しの前に再生側の AudioContext を止める（AudioEngine.suspendForExport）。Chrome では別の AudioContext が HRTF を処理していると、OfflineAudioContext の HRTF の結果が回ごとに変わる。書き出し以外で AudioContext を止めない（止めている間はブラウザが切り離したノードを解放せず、設定の変更のたびに畳み込みのメモリが積み上がる）。
+- 書き出しの余韻の長さは設定の IR の長さ・プリディレイから決め（exportSpec.reverbTailSeconds）、固定値にしない。先頭は処理の遅延を切り捨て、末尾は −100 dBFS を下回ってから 150 ms 後で切って 20 ms フェード。
+- 書き出しの完了表示は WAV の Blob ができてから。キャンセル・失敗時は結果（Object URL）を作らない。Object URL は次の書き出し・音源の読み込み・アンマウントで解放する。
 - 空間グラフは重低音グラフの後に直列（outputChain.ts）。ORIGINAL/PROCESSED は両段を同時に BYPASS し、直列でも原音とビット一致させる（再生エンジンでは時刻合わせの整数サンプル遅延だけ遅れた原音とビット一致）。
 - 空間処理は原音とラウドネスをそろえて A/B 比較させる。HRTF の前方定位は個人差があるため、成立を前提にした表示・説明をしない。単純な左右パン・回転を「空間化」と呼ばない。
 - Motion の位置は必ず「メディア時刻とパラメーターの純粋関数」にする（乱数・壁時計を使わない）。シーク・オフライン書き出しで同じ動きを再現するため。HRTF の PannerNode は固定方向で使い、位置の自動化をしない。
@@ -99,7 +106,8 @@ docs/PHASES.md 開発計画
 
 - 変更後は必ず `npm run build`（型チェック + ビルド）を実行し、エラーがないことを確認する。
 - `npm run lint`（oxlint）で警告を確認する。
-- 空間処理を変更したら `npm run test:spatial`（空間音響＋Motion）と `npm run test:tail`（Phase 04）を実行する。各スイートは別々のヘッドレスブラウザで順に実行される（Chrome が解析用の OfflineAudioContext を解放しないため）。空きメモリが 400 MB 未満になると中断する（`CSX_MIN_FREE_MB` で変更）。メモリに余裕があるときに 1 つずつ実行する。個別実行: `node scripts/run-dsp-selftest.mjs --suite=<motion|tail|cpu|tailcpu|baseline|preset|presetcpu> [--query=groups=26-32] [--log]`。
+- 空間処理を変更したら `npm run test:spatial`（空間音響＋Motion）と `npm run test:tail`（Phase 04）を実行する。各スイートは別々のヘッドレスブラウザで順に実行される（Chrome が解析用の OfflineAudioContext を解放しないため）。空きメモリが 400 MB 未満になると中断する（`CSX_MIN_FREE_MB` で変更）。メモリに余裕があるときに 1 つずつ実行する。個別実行: `node scripts/run-dsp-selftest.mjs --suite=<motion|tail|cpu|tailcpu|baseline|preset|presetcpu|export> [--query=groups=26-32] [--log]`。
+- 書き出しを変更したら `npm run test:export`（Phase 06。WAV・余韻・Motion の再現・リアルタイムとの一致・メモリ・キャンセル。8 セッション）を実行する。
 - プリセット・A/B 比較・CUSTOM・解析の最適化を変更したら `npm run test:preset`（Phase 05、13 のブラウザセッションに分けて順に実行）を実行する。INFO 行は合否を判定しない測定値（原因調査など）。
 - 音声処理を変更したら `npm run test:dsp`（ヘッドレス Chrome/Edge で DSP 自己診断）を実行する。既知の FAIL（EDM相当の低域絶対値、docs/PHASES.md 参照）以外が出ないことを確認する。検証項目は `src/dev/dspSelfTest.ts` に追加し、純音だけでなく楽曲相当信号（`src/dev/testSignals.ts`）でも確認する。合格基準を結果に合わせて緩めない。
 - 実装できていない機能は報告で「未実装」と明示する。動作確認していないことを「動作する」と書かない。

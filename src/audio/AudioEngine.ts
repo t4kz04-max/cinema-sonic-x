@@ -7,6 +7,7 @@ import { bassPlanKey, cloneDsp, spatialPlanKey, type DspConfig } from './dspConf
 import { bassBypassed, createOutputChain, spatialBypassed } from './outputChain'
 import { PlanCache } from './planCache'
 import { eqCapScale } from './biquadMath'
+import type { DynamicsSettings } from './dynamicsTypes'
 import { linearToDb } from './loudness'
 import { analyzeSpatialSource, buildSpatialExcerpt, planSpatial, wideCapFor, type SpatialPlan, type SpatialPlanOptions } from './spatial/spatialAnalysis'
 import type { Envelope } from './spatial/motion'
@@ -30,6 +31,15 @@ import { loadMotionWorklet, measureHrtfLatency, type SpatialGraph } from './spat
 import { DEFAULT_SPATIAL_PARAMS, type SpatialParams } from './spatial/spatialSpec'
 import type { StereoMetrics } from './stereoMetrics'
 import { dynamicsSettingsFor, loadDynamicsWorklet, measureCompressorMakeup, type ProcessingGraph } from './processingGraph'
+
+/** 書き出しに使う設定と処理計画（再生中のグラフと同じ値） */
+export interface ExportSnapshot {
+  dsp: DspConfig
+  bassScale: number
+  bassDynamics: DynamicsSettings
+  spatialTrimDb: number
+  wideSideCapDb: number
+}
 
 export class AudioContextUnavailableError extends Error {
   constructor(cause: unknown) {
@@ -88,6 +98,8 @@ const LOOP_ARM_AHEAD_SECONDS = 0.4
 /** 1 周がこれより短いループでは境界の残響消去をしない */
 const LOOP_RESET_MIN_PERIOD_SECONDS = 1
 
+/** STOP・自然終了の後、Motion の時刻を止めるまでの待ち時間（ms） */
+const TRANSPORT_STOP_DELAY_MS = 250
 /** ベクトルスコープ用 AnalyserNode のサイズ */
 const SCOPE_FFT_SIZE = 2048
 
@@ -169,9 +181,18 @@ export class AudioEngine {
   private appliedBassKey: string | null = null
   private appliedSpatialKey: string | null = null
   private cacheHits = 0
+  /** Motion への時刻の送信の世代（遅らせた送信が、その後の再生・シークを上書きしないように） */
+  private transportToken = 0
+  /** 書き出し中は新しい解析を始めない（メモリと CPU を書き出しに回す）。止めている間の要求は解除時にまとめて行う */
+  private analysisHeld = false
+  private heldRequests = { bass: false, spatial: false }
 
-  constructor(initialVolume: number) {
+  /** sampleRate: 試験用（書き出しとの比較で同じレートにする）。省略時はブラウザの既定 */
+  private readonly contextRate: number | undefined
+
+  constructor(initialVolume: number, opts: { sampleRate?: number } = {}) {
     this.volume = initialVolume
+    this.contextRate = opts.sampleRate
   }
 
   onStatusChange(listener: ((status: PlaybackStatus) => void) | null): void {
@@ -191,7 +212,7 @@ export class AudioEngine {
   private async setupContext(): Promise<AudioContext> {
     let ctx: AudioContext
     try {
-      ctx = new AudioContext({ latencyHint: 'playback' })
+      ctx = new AudioContext({ latencyHint: 'playback', sampleRate: this.contextRate })
     } catch (e) {
       throw new AudioContextUnavailableError(e)
     }
@@ -330,7 +351,7 @@ export class AudioEngine {
     this.teardownSource(this.status === 'playing' ? STOP_FADE_SECONDS : 0)
     this.offset = 0
     this.setStatus('stopped')
-    this.sendTransport()
+    this.sendTransportAfterTail()
   }
 
   /** CUT: 直接音と余韻の両方を速やかに止めて先頭へ（停止後に鳴っている余韻も止める） */
@@ -448,6 +469,75 @@ export class AudioEngine {
   }
 
   /** 現在の DSP 設定（書き出し・テスト用のコピー） */
+  /** 書き出し中など: 新しい解析を止める / 再開する（再開時に止めていた要求を行う） */
+  holdAnalysis(hold: boolean): void {
+    this.analysisHeld = hold
+    if (hold) return
+    const { bass, spatial } = this.heldRequests
+    this.heldRequests = { bass: false, spatial: false }
+    if (bass) this.requestPlan()
+    if (spatial) this.requestSpatialPlan()
+  }
+
+  /**
+   * 書き出し用: 現在の DSP 設定と、再生に使っているのと同じ処理計画（重低音の EQ 倍率・ダイナミクス、空間のトリム）。
+   * 計画がまだなければ解析が終わるまで待つ（タイムアウトで失敗）。音源の解析に失敗している場合も失敗
+   */
+  async exportSnapshot(timeoutMs = 120000): Promise<ExportSnapshot> {
+    await this.ensureReady()
+    const deadline = performance.now() + timeoutMs
+    for (let iter = 0; ; iter++) {
+      if (this.dsp.analysis === 'error' || this.dsp.spatial.analysis === 'error') throw new Error('音源の解析に失敗したため書き出せません。音源を読み込み直してください。')
+      const dsp = this.dspConfig()
+      const bp = this.bassPlans.get(bassPlanKey(dsp.bass))
+      const sp = dsp.spatial.mode === 'off' ? null : this.spatialPlans.get(this.spatialKey())
+      const bassReady = !dsp.bassEnabled || !!bp
+      const spatialReady = dsp.spatial.mode === 'off' || !!sp
+      if (bassReady && spatialReady && this.sourceAnalysis) {
+        return {
+          dsp,
+          bassScale: bp ? bp.scale : eqCapScale(dsp.bass) * this.safetyScale,
+          bassDynamics: bp ? bp.dynamics : dynamicsSettingsFor(dsp.bass.mode, bassThresholdFor(dsp.bass, this.sourceAnalysis), this.dsp.trimDb),
+          spatialTrimDb: sp ? sp.trimDb : 0,
+          wideSideCapDb: sp ? sp.wideSideCapDb : wideCapFor(this.spatialBefore),
+        }
+      }
+      if (performance.now() > deadline) throw new Error('解析が終わらないため書き出せません。しばらく待ってから再度お試しください。')
+      // 要求のたびにデバウンス（250 ms）が延びるため、最初と 2 秒ごとだけ要求する（解析中・待機中は進行に任せる）
+      if (iter % 20 === 0) {
+        this.requestPlan()
+        this.requestSpatialPlan()
+      }
+      await new Promise((r) => setTimeout(r, 100))
+    }
+  }
+
+  /**
+   * 書き出しの前: 再生中なら一時停止し、AudioContext を止める。
+   * Chrome では、別の AudioContext が HRTF を処理している間に OfflineAudioContext で HRTF を描画すると、結果が
+   * 回ごとに変わる（同じ設定で −8〜+1.6 dB の差を実測。止めている間は毎回一致）。書き出しの再現性のため、その間は再生側を止める。
+   * 書き出し以外では止めない（止めている間はブラウザが切り離したノードを解放しないため、設定を変えるたびに畳み込みのメモリが
+   * 積み上がる。停止中に自動で止める方式を試したが、プリセットの切替 20 回で +670 MB になったため戻した）
+   */
+  async suspendForExport(): Promise<void> {
+    if (this.status === 'playing') {
+      this.pause()
+      // PAUSE のフェード（20 ms）が終わってから止める
+      await new Promise((r) => setTimeout(r, 80))
+    }
+    if (this.ctx && this.ctx.state === 'running') await this.ctx.suspend()
+  }
+
+  /** 書き出しの後: AudioContext を再開する（再生は止めたまま。再生ボタンで続きから） */
+  async resumeAfterExport(): Promise<void> {
+    if (this.ctx && this.ctx.state === 'suspended') await this.ctx.resume()
+  }
+
+  /** 現在の音源（書き出し用）。未読み込みなら null */
+  getBuffer(): AudioBuffer | null {
+    return this.buffer
+  }
+
   dspConfig(): DspConfig {
     return cloneDsp({ spatial: this.spatialParams, bass: this.params, bassEnabled: this.bassEnabled })
   }
@@ -531,7 +621,20 @@ export class AudioEngine {
   }
 
   private sendTransport(): void {
+    this.transportToken++
     this.spatialGraph?.setTransport(this.transport())
+  }
+
+  /**
+   * STOP・自然終了: Motion の時刻を止めるのを、処理の中に残っている音（STFT の遅延 約 43 ms + 12 ms のフェード）が
+   * 出終わるまで遅らせる。すぐに止めると、残りの音の位置が先頭の位置へ移ってしまう（書き出しでは時刻が止まらないため、
+   * 書き出しと再生の末尾がずれていた）。間に再生・シークした場合は送らない
+   */
+  private sendTransportAfterTail(): void {
+    const token = ++this.transportToken
+    setTimeout(() => {
+      if (token === this.transportToken) this.sendTransport()
+    }, TRANSPORT_STOP_DELAY_MS)
   }
 
   private updateEnvelope(): void {
@@ -612,6 +715,10 @@ export class AudioEngine {
    * 全帯域トリム・安全制限・低域コンプしきい値は計測完了まで直前の値を保つ。
    */
   private requestPlan(): void {
+    if (this.analysisHeld) {
+      this.heldRequests.bass = true
+      return
+    }
     const key = bassPlanKey(this.params)
     if (!this.bassEnabled) {
       if (this.excerpt && key !== this.appliedBassKey && !this.planning) this.updateDsp({ analysis: 'standby' })
@@ -732,6 +839,10 @@ export class AudioEngine {
   }
 
   private requestSpatialPlan(): void {
+    if (this.analysisHeld) {
+      this.heldRequests.spatial = true
+      return
+    }
     const key = this.spatialKey()
     if (key === this.appliedSpatialKey && !this.spatialPlanning) return
     const cached = this.spatialExcerpt && this.spatialBefore ? this.spatialPlans.get(key) : undefined
@@ -851,12 +962,13 @@ export class AudioEngine {
       this.clearLoopTimer()
       this.offset = 0
       this.setStatus('stopped')
-      this.sendTransport()
+      this.sendTransportAfterTail()
     }
     node.start(when, offset)
     this.source = { node, gain }
     this.offset = offset
     this.startedAt = when - offset
+    this.transportToken++
     this.spatialGraph?.setTransport(this.playingTransport())
     this.armLoopBoundary()
   }

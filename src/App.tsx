@@ -60,7 +60,7 @@ function App() {
             onDismissError={player.clearError}
           />
           <SourceInfoPanel audio={audio} />
-          <ExportPanel />
+          <ExportPanel player={player} />
         </div>
         <div className="console__col console__col--main">
           <TransportPanel player={player} />
@@ -72,7 +72,7 @@ function App() {
       </main>
       <footer className="app-footer">
         <span>音源はお使いのブラウザ内でのみ処理されます。サーバーや外部サービスへは送信されません。</span>
-        <span className="mono">CINEMA SONIC X · Spatial Presets (Phase 05)</span>
+        <span className="mono">CINEMA SONIC X · Export (Phase 06)</span>
       </footer>
     </div>
   )

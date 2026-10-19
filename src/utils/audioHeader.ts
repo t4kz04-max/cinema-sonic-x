@@ -137,7 +137,31 @@ export function parseMp3Header(bytes: Uint8Array): SourceHeaderInfo | null {
   return null
 }
 
-/** ファイル先頭のバイト列から実際の形式を判定する。MP3/WAV でなければ null */
+/** FLAC: "fLaC" + STREAMINFO（サンプルレート 20 bit・チャンネル数 3 bit・ビット数 5 bit） */
+export function parseFlacHeader(bytes: Uint8Array): SourceHeaderInfo | null {
+  if (readAscii(bytes, 0, 4) !== 'fLaC' || bytes.length < 8 + 18) return null
+  if ((bytes[4] & 0x7f) !== 0) return { ...EMPTY_HEADER, codec: 'FLAC' }
+  const o = 8 + 10
+  const sampleRate = (bytes[o] << 12) | (bytes[o + 1] << 4) | (bytes[o + 2] >> 4)
+  const channels = ((bytes[o + 2] >> 1) & 0x07) + 1
+  const bitDepth = (((bytes[o + 2] & 0x01) << 4) | (bytes[o + 3] >> 4)) + 1
+  return { ...EMPTY_HEADER, sampleRate: sampleRate || null, channels, bitDepth, codec: 'FLAC' }
+}
+
+/** Ogg: 最初のページの識別ヘッダー（Vorbis / Opus）。Opus は常に 48 kHz でデコードされる */
+export function parseOggHeader(bytes: Uint8Array): SourceHeaderInfo | null {
+  if (readAscii(bytes, 0, 4) !== 'OggS' || bytes.length < 27) return null
+  const segs = bytes[26]
+  const p = 27 + segs
+  if (readAscii(bytes, p, 8) === 'OpusHead') return { ...EMPTY_HEADER, sampleRate: 48000, channels: bytes[p + 9] ?? null, codec: 'Opus' }
+  if (bytes[p] === 1 && readAscii(bytes, p + 1, 6) === 'vorbis' && bytes.length >= p + 16) {
+    const v = new DataView(bytes.buffer, bytes.byteOffset)
+    return { ...EMPTY_HEADER, sampleRate: v.getUint32(p + 12, true) || null, channels: bytes[p + 11], codec: 'Vorbis' }
+  }
+  return { ...EMPTY_HEADER, codec: 'Ogg' }
+}
+
+/** ファイル先頭のバイト列から実際の形式を判定する。対応する形式でなければ null */
 export function inspectAudioHeader(
   bytes: Uint8Array,
 ): { format: SourceFormat; header: SourceHeaderInfo } | null {
@@ -147,5 +171,12 @@ export function inspectAudioHeader(
   if (mp3) return { format: 'mp3', header: mp3 }
   // ID3 タグはあるがフレームを特定できない場合は、判定をデコーダーに委ねる
   if (id3v2End(bytes) > 0) return { format: 'mp3', header: { ...EMPTY_HEADER } }
+  // 以下はブラウザのデコーダーに任せる形式（サンプルレートは読める範囲で読む）
+  const flac = parseFlacHeader(bytes)
+  if (flac) return { format: 'flac', header: flac }
+  const ogg = parseOggHeader(bytes)
+  if (ogg) return { format: 'ogg', header: ogg }
+  if (readAscii(bytes, 4, 4) === 'ftyp') return { format: 'm4a', header: { ...EMPTY_HEADER, codec: 'MP4 / AAC など' } }
+  if (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) return { format: 'webm', header: { ...EMPTY_HEADER, codec: 'WebM（Opus / Vorbis）' } }
   return null
 }

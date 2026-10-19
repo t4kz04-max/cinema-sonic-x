@@ -11,7 +11,8 @@
     "test:dsp": "node scripts/run-dsp-selftest.mjs",
     "test:spatial": "node scripts/run-dsp-selftest.mjs --spatial",
     "test:tail": "node scripts/run-dsp-selftest.mjs --tail",
-    "test:preset": "node scripts/run-dsp-selftest.mjs --preset"
+    "test:preset": "node scripts/run-dsp-selftest.mjs --preset",
+    "test:export": "node scripts/run-dsp-selftest.mjs --export"
   },
   "dependencies": {
     "react": "^19.2.8",

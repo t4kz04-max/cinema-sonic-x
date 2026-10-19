@@ -1,7 +1,8 @@
 import type { Spectrum } from '../audio/spectrum'
 import type { StereoMetrics } from '../audio/stereoMetrics'
 
-export type SourceFormat = 'wav' | 'mp3'
+/** wav / mp3: 対応形式。flac / ogg / m4a / webm: ブラウザのデコーダーが対応していれば読み込める形式 */
+export type SourceFormat = 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'webm'
 
 /** ファイルヘッダーから読み取った元データの情報（取得できない項目は null） */
 export interface SourceHeaderInfo {
@@ -21,6 +22,8 @@ export interface LoadedAudio {
   header: SourceHeaderInfo
   /** AudioContext のサンプルレートでデコード済みの PCM */
   buffer: AudioBuffer
+  /** 元のファイル（書き出し時に元のサンプルレートでデコードし直すため。音声はブラウザの外へ送らない） */
+  file: File
 }
 
 export type PlaybackStatus = 'stopped' | 'playing' | 'paused'

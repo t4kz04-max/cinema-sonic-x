@@ -1836,3 +1836,89 @@
 .btn-chip:hover:not(:disabled) { border-color: var(--accent); }
 .btn-chip:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn-chip.is-active { border-color: var(--accent-hi); color: var(--accent-soft); }
+
+/* ===== Phase 06: 書き出し ===== */
+.export-depth { padding: 2px; }
+.export-depth .ab-switch__item { padding: 4px 10px; font-size: 11px; }
+
+.export-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.export-actions .btn-export { flex: 1; }
+
+.export-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.export-stages {
+  display: flex;
+  gap: 6px;
+  font: 11px/1 var(--mono);
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+}
+
+.export-stages span {
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+
+.export-stages span.is-current {
+  color: var(--accent-soft);
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.export-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--inset);
+  overflow: hidden;
+}
+
+.export-bar span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hi));
+}
+
+.export-done {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(52, 211, 153, 0.45);
+  background: rgba(16, 80, 60, 0.18);
+}
+
+.export-done__title {
+  font-weight: 800;
+  letter-spacing: 0.2em;
+  color: var(--ok);
+}
+
+.btn-export--download {
+  display: block;
+  text-align: center;
+  text-decoration: none;
+}
+
+.export-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.export-preview audio { width: 100%; }
+
+.export-doc { grid-template-columns: minmax(0, 1fr); margin-top: 14px; }

@@ -53,8 +53,8 @@ export async function loadAudioFile(
       ok: false,
       error: {
         kind: 'unsupported',
-        message: 'ファイルの中身を MP3 / WAV として認識できませんでした。',
-        detail: '拡張子だけが .mp3 / .wav に変更された別形式のファイルや、破損したファイルの可能性があります。',
+        message: 'ファイルの中身を対応する音声形式（WAV / MP3 / FLAC / Ogg / M4A / WebM）として認識できませんでした。',
+        detail: '拡張子だけが変更された別形式のファイルや、破損したファイルの可能性があります。',
       },
     }
   }
@@ -99,6 +99,7 @@ export async function loadAudioFile(
       format: inspected.format,
       header: inspected.header,
       buffer,
+      file,
     },
   }
 }

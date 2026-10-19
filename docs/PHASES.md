@@ -12,7 +12,7 @@
 | 03 | Dynamic Spatial Motion Engine | 実装済み・Chrome/Edge で検証済み（実楽曲での試聴は未実施） |
 | 04 | Immersive Audio Engine 2.0（Spatial Tail・Dynamic Tail・Loop） | 実装済み・Chrome/Edge で検証（1 件 FAIL、下記。原因は Phase 05 で特定）。試聴は未実施 |
 | 05 | Spatial Preset System | 実装済み・Chrome/Edge で検証（test:preset 全 PASS。既存試験に Phase 05 の修正で現れた FAIL 4 件、下記）。試聴は未実施 |
-| 06 | Audio Export Engine | 未着手 |
+| 06 | Audio Export Engine | 実装済み・Chrome/Edge で検証（test:export 58/58。既存試験の CPU は環境の負荷で FAIL、下記）。試聴は未実施 |
 | 07 | Video Processing Engine | 未着手 |
 | 08 | Simple UI + Studio | 未着手 |
 | 09 | Final Quality & Release | 未着手 |
@@ -218,12 +218,36 @@ source → input ─┬─ dry(1/0) ──────────────�
 
 ## Phase 06 — Audio Export Engine
 
+音源 → プリセット（詳細設定）→ EXPORT → 完成音声の試聴 → WAV のダウンロード、の一連の流れ。詳細・測定結果は docs/SPATIAL.md。
+
+**実装内容**
+- 書き出し: 再生と同じ `createOutputChain`・同じ処理計画で、音源全体 + 余韻を OfflineAudioContext で描画（Motion は曲の先頭から）。使い捨ての iframe で実行し、終わったら破棄（Chrome が解放しない文脈のメモリを返す）
+- 余韻: 設定の IR の長さ・プリディレイから長さを決め、−100 dBFS を下回ってから 150 ms 後で切り、20 ms フェード。先頭は処理の遅延を切り捨てて元の音源と同じ時刻に
+- WAV: RIFF / PCM / ステレオ / 元のサンプルレート / 16-bit（TPDF ディザ、シード付き）・24-bit、4 GiB の制限の確認
+- EXPORT パネル: 設定・形式・サンプルレート・推定の長さ・ファイルサイズ・メモリ、段階表示（PREPARING / RENDERING（実測の進捗）/ ENCODING / PROCESSING COMPLETE）、キャンセル、ダウンロード、書き出した WAV そのもののプレビュー（ORIGINAL との切替）
+- 入力形式: WAV / MP3 に加え、FLAC / Ogg / M4A / WebM をブラウザのデコーダーで読み込み（対応状況を表示）
+- メモリ: 書き出し前の見積もりと上限、書き出し中は解析を止める、Object URL の解放、二重実行の防止、メモリ不足のエラー表示
+- 見つけて直したこと: Chrome の HRTF の同時処理で書き出しの結果が変わる（書き出し中は再生側の AudioContext を止める）、重低音 OFF で音源の終わりの 5 ms が欠ける、STOP・自然終了で Motion の位置が飛ぶ、解析の待機でデバウンスが延び続ける
+
 **完了条件**
-- [ ] OfflineAudioContext で再生時と同じグラフ（重低音・空間・Motion）をレンダリングし、WAV（16/24 bit）に書き出す
-- [ ] Motion はメディア時刻 0 から再現し、リアルタイム再生と同じ動きになる（テストで比較）
-- [ ] 長尺ファイルの分割レンダリングと進捗表示・キャンセル、メモリ使用量の確認
-- [ ] 書き出したファイルにクリップがなく、一般的なプレイヤーで再生できる
-- [ ] 処理はすべてブラウザ内で完結（外部送信なし）
+- [x] 音声を読み込める（WAV / MP3 / ブラウザが対応する形式）
+- [x] プリセットを選択できる（CUSTOM を含む。書き出しの設定 = 再生の設定）
+- [x] 加工済み音声を生成できる（Chrome / Edge の実アプリで確認）
+- [x] 完成音声を再生できる（書き出した WAV を <audio> で再生。再生用の DSP は通さない）
+- [x] WAV をダウンロードできる（実アプリでダウンロードしたファイルのヘッダー・長さを確認）
+- [x] 残響が末尾まで保存される（余韻の終わり ≤ −100 dBFS、最後のサンプル 0、既存 HALL の余韻 1650 ms）
+- [x] Motion が再現される（書き出し 2 回・シーク後の書き出しが −120 dB 以下で一致、リアルタイムと Motion の動きの相関 1.000）
+- [x] Chrome / Edge で動作する（test:export・実アプリ）
+- [x] build / lint が成功する
+- [x] テスト結果を記録（下記・docs/SPATIAL.md）
+- [ ] 実楽曲・ヘッドホンでの試聴（未実施）
+
+**試験結果（Phase 06 の変更後、Chrome / Edge）**
+- test:export（新規）: 58 PASS / 0 FAIL + INFO 21（両ブラウザ）。リアルタイム再生との一致は 8 条件すべて PASS（統計的な指標）。サンプル単位では一致しない（Motion の STFT のフレームの区切りが再生開始の位置で変わるため。docs/SPATIAL.md）
+- 既存の試験で FAIL が増えたもの（いずれも基準は変えていない）:
+  - CPU（test:preset 4 件・test:tail 2 件・test:spatial 1 件）: 実時間比 51〜72%（基準 50%）。Phase 05 のコミットを同じ時間に測っても同じ値で、試験環境の負荷によるもの（Phase 05 の測定時の約 2 倍）。静かな状態での再測定は未実施
+  - 実時間の A/B 切替の位置の連続性（test:preset、1 件）: −52〜−68 ms（基準 50 ms）。Phase 05 のコードでも同じ条件で −36〜−42 ms の外れ値。再実行で PASS の回もある
+- 既知の FAIL（Phase 05 から変わらず）: test:spatial の Motion 4 件、test:tail 1 件、test:dsp 1 件
 
 ## Phase 07 — Video Processing Engine
 

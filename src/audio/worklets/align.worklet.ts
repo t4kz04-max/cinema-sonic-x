@@ -35,7 +35,7 @@ class AlignProcessor extends AudioWorkletProcessor {
     const channels = output.length
     while (this.buf.length < channels) this.buf.push(new Float32Array(this.size))
     for (let c = 0; c < channels; c++) {
-      // 入力が未接続・モノラルの場合は 0ch 目を使う（channelInterpretation 'speakers' の upmix と同じ）
+      // 入力が未接続のときは 0 を書き込む（遅延線に残った音は出し続ける）
       const x = input[c] ?? input[0]
       const b = this.buf[c]
       const y = output[c]

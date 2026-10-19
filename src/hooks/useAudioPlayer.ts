@@ -7,6 +7,10 @@ import { DEFAULT_SPATIAL_PARAMS, type SpatialParams } from '../audio/spatial/spa
 import { cloneDsp, dspEquals, type DspConfig } from '../audio/dspConfig'
 import { getPreset, matchPreset, presetToDsp, type PresetId } from '../audio/presets/spatialPresets'
 import { deleteCustom, loadCustom, saveCustom, type SavedCustom } from '../utils/customPresetStorage'
+import { estimateExportBytes, EXPORT_MAX_SECONDS, exportMemoryBudget, type ExportProgress, type ExportResult } from '../audio/export/exportSpec'
+import { ExportCancelledError, startExport, type ExportJob } from '../audio/export/exportRunner'
+import type { WavBitDepth } from '../audio/export/wavEncoder'
+import { formatBytes } from '../utils/format'
 import type { DspMeters, DspStatus, LoadError, LoadedAudio, PlaybackStatus } from '../types/audio'
 
 /** 初期音量（%）。gain = (40/100)^2 = 0.16 ≒ -15.9 dB と控えめにする */
@@ -30,6 +34,16 @@ const INITIAL_LOOP: LoopState = { enabled: false, type: 'normal' }
  * 最後にカードから適用した設定の出どころ。詳細設定を変えると DSP 設定がこれと一致しなくなり CUSTOM になる
  */
 export type PresetSource = { kind: 'preset'; id: PresetId } | { kind: 'saved' } | null
+
+export type ExportState =
+  | { state: 'idle' }
+  | { state: 'running'; progress: ExportProgress }
+  | { state: 'complete'; result: ExportResult; url: string; fileName: string; settingsLabel: string }
+  | { state: 'cancelled' }
+  | { state: 'error'; message: string; detail?: string }
+
+/** ファイル名に使えない文字を除く */
+const safeName = (s: string) => s.replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, '_').slice(0, 80)
 
 export interface PresetState {
   source: PresetSource
@@ -72,6 +86,15 @@ export function useAudioPlayer() {
   const [initialSaved] = useState(loadCustom)
   const [saved, setSaved] = useState<SavedCustom | null>(initialSaved.ok ? initialSaved.value : null)
   const [storageMessage, setStorageMessage] = useState<string | null>(initialSaved.ok ? null : initialSaved.message)
+  const [exportState, setExportState] = useState<ExportState>({ state: 'idle' })
+  const exportJobRef = useRef<ExportJob | null>(null)
+  const exportUrlRef = useRef<string | null>(null)
+  /** 元のファイルのプレビュー用 Object URL（音源を読み込むたびに作り直し、前のものは解放する） */
+  const [originalUrl, setOriginalUrl] = useState<string | null>(null)
+  const originalUrlRef = useRef<string | null>(null)
+  const exportRunningRef = useRef(false)
+  /** 準備中（フレームを作る前）のキャンセル要求 */
+  const exportCancelRef = useRef(false)
 
   const getEngine = useCallback((): AudioEngine => {
     if (!engineRef.current) {
@@ -111,6 +134,26 @@ export function useAudioPlayer() {
     }
   }, [status])
 
+  /** 書き出し結果を破棄する（Object URL を解放し、実行中ならキャンセル） */
+  const resetExport = useCallback(() => {
+    exportJobRef.current?.cancel()
+    exportJobRef.current = null
+    if (exportUrlRef.current) URL.revokeObjectURL(exportUrlRef.current)
+    exportUrlRef.current = null
+    setExportState({ state: 'idle' })
+  }, [])
+
+  useEffect(
+    () => () => {
+      exportJobRef.current?.cancel()
+      if (exportUrlRef.current) URL.revokeObjectURL(exportUrlRef.current)
+      if (originalUrlRef.current) URL.revokeObjectURL(originalUrlRef.current)
+      exportUrlRef.current = null
+      originalUrlRef.current = null
+    },
+    [],
+  )
+
   const loadFile = useCallback(
     async (file: File) => {
       const token = ++loadTokenRef.current
@@ -126,6 +169,10 @@ export function useAudioPlayer() {
           setError(result.error)
           return
         }
+        resetExport()
+        if (originalUrlRef.current) URL.revokeObjectURL(originalUrlRef.current)
+        originalUrlRef.current = URL.createObjectURL(result.audio.file)
+        setOriginalUrl(originalUrlRef.current)
         engine.setBuffer(result.audio.buffer)
         setMusicRegion(engine.getMusicRegion())
         setAudio(result.audio)
@@ -134,7 +181,7 @@ export function useAudioPlayer() {
         if (token === loadTokenRef.current) setLoadingName(null)
       }
     },
-    [getEngine],
+    [getEngine, resetExport],
   )
 
   const play = useCallback(async () => {
@@ -271,6 +318,76 @@ export function useAudioPlayer() {
     return { source: presetSource, activeId, custom: presetSource !== null && activeId === null && !savedActive, savedActive, saved, storageMessage }
   }, [dspConfig, presetSource, saved, storageMessage])
 
+  /**
+   * 書き出し: 再生と同じ設定・処理計画で、音源全体 + 余韻をオフラインレンダリングして WAV にする。
+   * 実行中は二重に実行しない。完了したときだけ結果（Object URL）を作る
+   */
+  const exportWav = useCallback(
+    async (bitDepth: WavBitDepth, settingsLabel: string) => {
+      const engine = engineRef.current
+      if (!engine || !audio || exportRunningRef.current) return
+      exportRunningRef.current = true
+      exportCancelRef.current = false
+      const checkCancel = () => {
+        if (exportCancelRef.current) throw new ExportCancelledError()
+      }
+      if (exportUrlRef.current) URL.revokeObjectURL(exportUrlRef.current)
+      exportUrlRef.current = null
+      setExportState({ state: 'running', progress: { stage: 'preparing' } })
+      try {
+        const snap = await engine.exportSnapshot()
+        checkCancel()
+        // 元のサンプルレートで書き出す（AudioContext のレートと違う場合は、元のファイルをそのレートでデコードし直す）
+        let source = audio.buffer
+        const native = audio.header.sampleRate
+        if (native && native !== source.sampleRate && native >= 8000 && native <= 384000) {
+          const ctx = new OfflineAudioContext(1, 1, native)
+          source = await ctx.decodeAudioData(await audio.file.arrayBuffer())
+        }
+        if (source.duration > EXPORT_MAX_SECONDS) throw new RangeError(`書き出せる長さは ${EXPORT_MAX_SECONDS / 60} 分までです（音源 ${(source.duration / 60).toFixed(1)} 分）。`)
+        const need = estimateExportBytes(source.length, source.numberOfChannels, source.sampleRate, snap.dsp.spatial, bitDepth)
+        const budget = exportMemoryBudget((navigator as Navigator & { deviceMemory?: number }).deviceMemory)
+        if (need > budget) throw new RangeError(`書き出しに必要なメモリの見積もり（${formatBytes(need)}）が上限（${formatBytes(budget)}）を超えます。短い音源で書き出してください。`)
+        checkCancel()
+        const channels = Array.from({ length: source.numberOfChannels }, (_, c) => source.getChannelData(c).slice())
+        engine.holdAnalysis(true)
+        await engine.suspendForExport()
+        checkCancel()
+        const job = startExport(
+          { channels, sampleRate: source.sampleRate, ...snap, bitDepth, ditherSeed: 1 },
+          (progress) => setExportState({ state: 'running', progress }),
+        )
+        exportJobRef.current = job
+        const result = await job.promise
+        const url = URL.createObjectURL(result.blob)
+        exportUrlRef.current = url
+        const base = audio.fileName.replace(/\.[^.]+$/, '')
+        setExportState({ state: 'complete', result, url, fileName: `${safeName(base)}_${safeName(settingsLabel)}_${result.bitDepth}bit.wav`, settingsLabel })
+      } catch (e) {
+        if (e instanceof ExportCancelledError) setExportState({ state: 'cancelled' })
+        else {
+          const memory = e instanceof RangeError || /memory|allocation/i.test(String(e))
+          setExportState({
+            state: 'error',
+            message: memory ? 'メモリが足りないため書き出せませんでした。' : '書き出しに失敗しました。',
+            detail: e instanceof Error ? e.message : String(e),
+          })
+        }
+      } finally {
+        exportJobRef.current = null
+        exportRunningRef.current = false
+        engineRef.current?.holdAnalysis(false)
+        void engineRef.current?.resumeAfterExport()
+      }
+    },
+    [audio],
+  )
+
+  const cancelExport = useCallback(() => {
+    exportCancelRef.current = true
+    exportJobRef.current?.cancel()
+  }, [])
+
   const readMotion = useCallback(() => engineRef.current?.getMotionReport() ?? null, [])
   const readTail = useCallback(() => engineRef.current?.getTailReport() ?? null, [])
 
@@ -327,6 +444,11 @@ export function useAudioPlayer() {
     applySavedCustom,
     saveCurrentCustom,
     deleteSavedCustom,
+    exportState,
+    originalUrl,
+    exportWav,
+    cancelExport,
+    resetExport,
   }
 }
 

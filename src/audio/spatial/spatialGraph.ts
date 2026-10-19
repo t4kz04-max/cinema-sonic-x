@@ -626,6 +626,11 @@ export interface SpatialGraph {
   bypassAlignSeconds(): number | null
   /** 処理経路で原音（中央の音）が出てくるまでの遅延（秒、現在の設定の目標値）。ORIGINAL の時刻合わせに使う */
   latencySeconds(): number
+  /**
+   * 処理経路で最も早く音が出てくるまでの遅延（秒）: モードの遅延（Motion の STFT・HRTF）+ 出力段リミッターの先読み。
+   * Motion の CENTER の伝搬遅延は含めない（距離による意図した遅れ）。書き出しで先頭から切り捨てる長さ
+   */
+  processingLatencySeconds(): number
   /** テスト用: Dynamic Tail のゲイン（モノラル）と、畳み込みの組の数 */
   debug: { tailGain: AudioNode | null; reverbSlots(): number }
 }
@@ -984,6 +989,7 @@ export function createSpatialGraph(ctx: BaseAudioContext, opts: SpatialGraphOpti
     },
     bypassAlignSeconds: () => (bypassAlign ? bypassAlign.frames / ctx.sampleRate : null),
     latencySeconds: () => compareLatencyOf(currentParams),
+    processingLatencySeconds: () => (currentParams.mode === 'off' ? 0 : latencyOf(currentParams) + outputLatency),
     debug: {
       tailGain: tail?.gainProbe ?? null,
       reverbSlots: () => tail?.slotCount ?? 0,
