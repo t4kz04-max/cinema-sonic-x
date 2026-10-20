@@ -1,3 +1,4 @@
+import { keepHrtfLoaded } from '../hrtfKeeper'
 import { createAlignDelay } from '../alignDelay'
 import type { DynamicsMeter } from '../dynamicsTypes'
 import motionWorkletUrl from '../worklets/motion.worklet.ts?worker&url'
@@ -1006,21 +1007,42 @@ const hrtfLatencyCache = new Map<number, Promise<number>>()
 export function measureHrtfLatency(sampleRate: number): Promise<number> {
   let p = hrtfLatencyCache.get(sampleRate)
   if (!p) {
+    // 測る前に、このサンプルレートの HRTF のデータを持ち続ける文脈を作る（Edge で測定が止まる問題の対策。hrtfKeeper.ts）
+    keepHrtfLoaded(sampleRate)
     p = (async () => {
-      const len = Math.round(sampleRate * 0.1)
-      const ctx = new OfflineAudioContext(2, len, sampleRate)
-      const imp = new AudioBuffer({ length: len, numberOfChannels: 1, sampleRate })
-      imp.getChannelData(0)[0] = 1
-      const src = new AudioBufferSourceNode(ctx, { buffer: imp })
-      src.connect(createHrtfPanner(ctx, 0, 0)).connect(ctx.destination)
-      src.start()
-      const out = (await ctx.startRendering()).getChannelData(0)
-      let idx = 0
-      for (let i = 1; i < out.length; i++) if (Math.abs(out[i]) > Math.abs(out[idx])) idx = i
-      return idx / sampleRate
+      // Edge で、この 0.1 秒のレンダリングがまれに終わらない（OfflineAudioContext が running のまま。Phase 07 で確認、原因は未確定）。
+      // 1 回の上限を設け、止まったら新しい文脈で 1 回だけやり直す（止まった文脈は JS から止められないので手放すだけ）
+      for (let attempt = 1; attempt <= HRTF_MEASURE_ATTEMPTS; attempt++) {
+        const out = await Promise.race([renderHrtfImpulse(sampleRate), new Promise<null>((r) => setTimeout(() => r(null), HRTF_MEASURE_TIMEOUT_MS))])
+        if (!out) {
+          console.warn('[CINEMA SONIC X] HRTF の遅延の測定が終わらないため、やり直します', JSON.stringify({ sampleRate, attempt }))
+          continue
+        }
+        let idx = 0
+        for (let i = 1; i < out.length; i++) if (Math.abs(out[i]) > Math.abs(out[idx])) idx = i
+        return idx / sampleRate
+      }
+      throw new Error('HRTF（立体音響）の処理の準備が終わりませんでした。ページを読み込み直してください。')
     })()
     hrtfLatencyCache.set(sampleRate, p)
+    // 失敗した測定は覚えない（次に呼ばれたときに測り直す）
+    p.catch(() => hrtfLatencyCache.delete(sampleRate))
   }
   return p
+}
+
+/** HRTF の遅延の測定 1 回の上限（ms。通常は 0.1 秒の描画で数十〜数百 ms）と回数 */
+const HRTF_MEASURE_TIMEOUT_MS = 10000
+const HRTF_MEASURE_ATTEMPTS = 2
+
+async function renderHrtfImpulse(sampleRate: number): Promise<Float32Array> {
+  const len = Math.round(sampleRate * 0.1)
+  const ctx = new OfflineAudioContext(2, len, sampleRate)
+  const imp = new AudioBuffer({ length: len, numberOfChannels: 1, sampleRate })
+  imp.getChannelData(0)[0] = 1
+  const src = new AudioBufferSourceNode(ctx, { buffer: imp })
+  src.connect(createHrtfPanner(ctx, 0, 0)).connect(ctx.destination)
+  src.start()
+  return (await ctx.startRendering()).getChannelData(0)
 }
 

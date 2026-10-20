@@ -1922,3 +1922,11 @@
 .export-preview audio { width: 100%; }
 
 .export-doc { grid-template-columns: minmax(0, 1fr); margin-top: 14px; }
+
+/* ===== Phase 07: 動画 ===== */
+.video-preview { width: 100%; max-height: 260px; border-radius: 8px; background: #000; margin-top: 10px; }
+.video-track { display: block; }
+.video-actions { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
+.video-action { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel-2); }
+.video-action .btn-chip { align-self: flex-start; }
+.video-tail .ab-switch__item { padding: 6px 10px; font-size: 11px; letter-spacing: 0.04em; }

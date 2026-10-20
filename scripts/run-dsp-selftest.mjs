@@ -4,6 +4,8 @@
 //         npm run test:tail           （Phase 04: Spatial Tail / Loop / STOP・PAUSE・CUT。4 つに分けて実行）
 //         npm run test:preset         （Phase 05: プリセット / A/B 比較 / CUSTOM / 解析の最適化。13 に分けて実行）
 //         npm run test:export         （Phase 06: 書き出し / WAV / リアルタイムとの一致 / メモリ / キャンセル）
+//         npm run test:video          （Phase 07: 動画の読み込み / 音声の抽出 / 音声の差し替え / 同期 / キャンセル / メモリ / 監視）
+//         npm run test:video:diagnostic （Phase 07: メモリの内訳の診断。合否なし。通常の test:video には含めない）
 //         node scripts/run-dsp-selftest.mjs --suite=cpu   （個別スイート。--log で途中経過を表示）
 //         node scripts/run-dsp-selftest.mjs --suite=tail --query=groups=26-32   （一部のグループだけ）
 //         CSX_BROWSER=<実行ファイル> npm run test:dsp
@@ -72,8 +74,13 @@ const suites = named
               'export&groups=67-67',
               'export&groups=68-68',
               'export&groups=69-71',
+              'export&groups=72-72',
             ]
-          : ['']
+          : process.argv.includes('--video')
+            ? ['video&groups=80-82', 'video&groups=83-84', 'video&groups=85-85', 'video&groups=86-87', 'video&groups=88-88', 'video&groups=89-90']
+            : process.argv.includes('--video-diagnostic')
+              ? ['video&groups=98-98&mode=export&rounds=4', 'video&groups=98-98&mode=cancel&rounds=3']
+              : ['']
 const MIN_FREE_MB = Number(process.env.CSX_MIN_FREE_MB ?? 400)
 
 const server = await createServer({ logLevel: 'error', server: { port: 5199, strictPort: false } })
@@ -132,7 +139,37 @@ async function runSuite(suite) {
     }
   }
 
+  /** プロセスの種類ごとの物理メモリ（ワーキングセット）とコミット済みのプライベートメモリ（MB）。メモリの原因の調査用（Windows のみ） */
+  const browserMemoryDetail = () => {
+    if (process.platform !== 'win32') return null
+    try {
+      const dir = profile.replace(/'/g, "''")
+      const out = execFileSync(
+        'powershell',
+        ['-NoProfile', '-Command', `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('${dir}') } | ForEach-Object { $t = if ($_.CommandLine -match '--type=([a-z-]+)') { $Matches[1] } else { 'browser' }; if ($_.CommandLine -match 'utility-sub-type=([A-Za-z.]+)') { $t += ':' + $Matches[1] }; '{0}|{1}|{2}' -f $t, $_.WorkingSetSize, $_.PrivatePageCount }`],
+        { encoding: 'utf8' },
+      )
+      const d = {}
+      for (const line of out.trim().split(/\r?\n/)) {
+        const [t, ws, priv] = line.split('|')
+        if (!t) continue
+        const e = (d[t] ||= { ws: 0, priv: 0, n: 0 })
+        e.ws += Number(ws) / 2 ** 20
+        e.priv += Number(priv) / 2 ** 20
+        e.n++
+      }
+      for (const e of Object.values(d)) {
+        e.ws = Math.round(e.ws)
+        e.priv = Math.round(e.priv)
+      }
+      return d
+    } catch {
+      return null
+    }
+  }
+
   const result = { done: false, lowMemory: false, title: '', text: '' }
+  const startedAt = Date.now()
   try {
     let target
     for (let i = 0; i < 80 && !target; i++) {
@@ -161,6 +198,12 @@ async function runSuite(suite) {
       const m = JSON.parse(ev.data)
       // --log: ページの console.info（試験の途中経過）をそのまま表示する
       if (showLog && m.method === 'Runtime.consoleAPICalled' && m.params.type === 'info') console.log(m.params.args.map((a) => a.value ?? a.description).join(' '))
+      // --log: 書き出し用フレームの段階の記録（console.debug。スレッドが止まっても止まる直前まで残る）
+      if (showLog && m.method === 'Runtime.consoleAPICalled' && m.params.type === 'debug' && String(m.params.args[0]?.value ?? '').startsWith('[CINEMA SONIC X]'))
+        console.log(`TRACE +${((m.params.timestamp - startedAt) / 1000).toFixed(1)}s`, m.params.args.slice(1).map((a) => a.value ?? a.description).join(' '))
+      // アプリの警告（書き出しの監視での打ち切りなど）は --log がなくても表示する
+      if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'warning' && String(m.params.args[0]?.value ?? '').startsWith('[CINEMA SONIC X]'))
+        console.log('WARN', m.params.args.map((a) => a.value ?? a.description).join(' '))
       if (m.id && pending.has(m.id)) {
         pending.get(m.id)(m)
         pending.delete(m.id)
@@ -170,10 +213,22 @@ async function runSuite(suite) {
         const mb = browserMemoryMb()
         void send('Runtime.evaluate', { expression: `(window.__csxMem ||= {})[${JSON.stringify(m.params.payload)}] = ${mb === null ? 'null' : mb.toFixed(1)}` })
       }
+      // 調査用: プロセスごとの内訳（window.csxMemDetail(id)）と、メモリ不足の通知（window.csxPressure(id)、キャッシュを捨てさせる）
+      if (m.method === 'Runtime.bindingCalled' && m.params.name === 'csxMemDetail') {
+        const d = browserMemoryDetail()
+        void send('Runtime.evaluate', { expression: `(window.__csxMem ||= {})[${JSON.stringify(m.params.payload)}] = ${JSON.stringify(d)}` })
+      }
+      if (m.method === 'Runtime.bindingCalled' && m.params.name === 'csxPressure') {
+        void send('Memory.simulatePressureNotification', { level: 'critical' }).then((r) =>
+          send('Runtime.evaluate', { expression: `(window.__csxMem ||= {})[${JSON.stringify(m.params.payload)}] = ${JSON.stringify(r.error ? r.error.message : 'ok')}` }),
+        )
+      }
     })
 
     await send('Runtime.enable')
     await send('Runtime.addBinding', { name: 'csxMemSample' })
+    await send('Runtime.addBinding', { name: 'csxMemDetail' })
+    await send('Runtime.addBinding', { name: 'csxPressure' })
     await send('Page.navigate', { url: pageUrl })
     const deadline = Date.now() + 1_800_000 // Motion・Tail のスイートはそれぞれ数分〜10 分かかる
     while (!result.done && Date.now() < deadline) {

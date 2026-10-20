@@ -1,8 +1,12 @@
 import type { Spectrum } from '../audio/spectrum'
 import type { StereoMetrics } from '../audio/stereoMetrics'
+import type { VideoInfo } from '../video/videoSpec'
 
-/** wav / mp3: 対応形式。flac / ogg / m4a / webm: ブラウザのデコーダーが対応していれば読み込める形式 */
-export type SourceFormat = 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'webm'
+/**
+ * wav / mp3: 対応形式。flac / ogg / m4a / webm: ブラウザのデコーダーが対応していれば読み込める形式。
+ * mp4 / mov / mkv（と映像つきの webm）: 動画（Phase 07。音声トラックを取り出して処理する）
+ */
+export type SourceFormat = 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'webm' | 'mp4' | 'mov' | 'mkv'
 
 /** ファイルヘッダーから読み取った元データの情報（取得できない項目は null） */
 export interface SourceHeaderInfo {
@@ -24,6 +28,11 @@ export interface LoadedAudio {
   buffer: AudioBuffer
   /** 元のファイル（書き出し時に元のサンプルレートでデコードし直すため。音声はブラウザの外へ送らない） */
   file: File
+  /**
+   * 動画のとき: コンテナ・トラックの情報と、取り出した音声の開始時刻（秒、映像と同じ時刻の軸）。
+   * buffer は音声トラックを元のサンプルレートでデコードしたもの（decodeAudioData は開始時刻を失うため使わない）
+   */
+  video?: { info: VideoInfo; audioStart: number }
 }
 
 export type PlaybackStatus = 'stopped' | 'playing' | 'paused'
@@ -93,6 +102,7 @@ export type LoadErrorKind =
   | 'decode'
   | 'memory'
   | 'context'
+  | 'no-audio'
 
 export interface LoadError {
   kind: LoadErrorKind

@@ -8,9 +8,12 @@ import { cloneDsp, dspEquals, type DspConfig } from '../audio/dspConfig'
 import { getPreset, matchPreset, presetToDsp, type PresetId } from '../audio/presets/spatialPresets'
 import { deleteCustom, loadCustom, saveCustom, type SavedCustom } from '../utils/customPresetStorage'
 import { estimateExportBytes, EXPORT_MAX_SECONDS, exportMemoryBudget, type ExportProgress, type ExportResult } from '../audio/export/exportSpec'
-import { ExportCancelledError, startExport, type ExportJob } from '../audio/export/exportRunner'
+import { ExportCancelledError, ExportTimeoutError, pendingRetainedBytes, retainedReleaseWaitMs, startExport, type ExportJob } from '../audio/export/exportRunner'
 import type { WavBitDepth } from '../audio/export/wavEncoder'
 import { formatBytes } from '../utils/format'
+import type { VideoExportResult, VideoJob, VideoJobProgress } from '../video/videoExport'
+import { encodeWav } from '../audio/export/wavEncoder'
+import { estimateVideoExportBytes, EXT_OF, VideoCancelledError, VideoTimeoutError, type VideoTailMode } from '../video/videoSpec'
 import type { DspMeters, DspStatus, LoadError, LoadedAudio, PlaybackStatus } from '../types/audio'
 
 /** 初期音量（%）。gain = (40/100)^2 = 0.16 ≒ -15.9 dB と控えめにする */
@@ -44,6 +47,28 @@ export type ExportState =
 
 /** ファイル名に使えない文字を除く */
 const safeName = (s: string) => s.replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, '_').slice(0, 80)
+
+/**
+ * 直前の書き出しでブラウザがまだ持っているメモリ（exportRunner.pendingRetainedBytes）を足しても上限を超えないか。
+ * 超える場合は、戻るまでの目安の時間を示して止める（続けて書き出したときにメモリが積み上がるのを防ぐ）
+ */
+function checkRetainedMemory(need: number, budget: number): void {
+  const retained = pendingRetainedBytes()
+  if (need + retained <= budget) return
+  const wait = Math.ceil(retainedReleaseWaitMs() / 1000)
+  throw new RangeError(
+    `直前の書き出しのメモリ（見積もり ${formatBytes(retained)}）がまだブラウザに残っているため、続けて書き出すと上限（${formatBytes(budget)}）を超えます。約 ${wait} 秒待ってから、もう一度書き出してください。`,
+  )
+}
+
+/** 動画の処理（Phase 07）の状態 */
+export type VideoExportState =
+  | { state: 'idle' }
+  | { state: 'running'; kind: 'original-wav' | 'video'; progress: VideoJobProgress }
+  | { state: 'complete'; kind: 'original-wav'; url: string; fileName: string; bytes: number; seconds: number }
+  | { state: 'complete'; kind: 'video'; url: string; fileName: string; result: VideoExportResult; settingsLabel: string }
+  | { state: 'cancelled' }
+  | { state: 'error'; message: string; detail?: string }
 
 export interface PresetState {
   source: PresetSource
@@ -95,6 +120,10 @@ export function useAudioPlayer() {
   const exportRunningRef = useRef(false)
   /** 準備中（フレームを作る前）のキャンセル要求 */
   const exportCancelRef = useRef(false)
+  const [videoState, setVideoState] = useState<VideoExportState>({ state: 'idle' })
+  const videoJobRef = useRef<VideoJob<VideoExportResult> | null>(null)
+  const videoUrlRef = useRef<string | null>(null)
+  const videoCancelRef = useRef(false)
 
   const getEngine = useCallback((): AudioEngine => {
     if (!engineRef.current) {
@@ -141,6 +170,12 @@ export function useAudioPlayer() {
     if (exportUrlRef.current) URL.revokeObjectURL(exportUrlRef.current)
     exportUrlRef.current = null
     setExportState({ state: 'idle' })
+    videoCancelRef.current = true
+    videoJobRef.current?.cancel()
+    videoJobRef.current = null
+    if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current)
+    videoUrlRef.current = null
+    setVideoState({ state: 'idle' })
   }, [])
 
   useEffect(
@@ -148,8 +183,11 @@ export function useAudioPlayer() {
       exportJobRef.current?.cancel()
       if (exportUrlRef.current) URL.revokeObjectURL(exportUrlRef.current)
       if (originalUrlRef.current) URL.revokeObjectURL(originalUrlRef.current)
+      videoJobRef.current?.cancel()
+      if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current)
       exportUrlRef.current = null
       originalUrlRef.current = null
+      videoUrlRef.current = null
     },
     [],
   )
@@ -348,6 +386,7 @@ export function useAudioPlayer() {
         const need = estimateExportBytes(source.length, source.numberOfChannels, source.sampleRate, snap.dsp.spatial, bitDepth)
         const budget = exportMemoryBudget((navigator as Navigator & { deviceMemory?: number }).deviceMemory)
         if (need > budget) throw new RangeError(`書き出しに必要なメモリの見積もり（${formatBytes(need)}）が上限（${formatBytes(budget)}）を超えます。短い音源で書き出してください。`)
+        checkRetainedMemory(need, budget)
         checkCancel()
         const channels = Array.from({ length: source.numberOfChannels }, (_, c) => source.getChannelData(c).slice())
         engine.holdAnalysis(true)
@@ -369,7 +408,7 @@ export function useAudioPlayer() {
           const memory = e instanceof RangeError || /memory|allocation/i.test(String(e))
           setExportState({
             state: 'error',
-            message: memory ? 'メモリが足りないため書き出せませんでした。' : '書き出しに失敗しました。',
+            message: e instanceof ExportTimeoutError ? '書き出しが途中で止まったため中止しました。もう一度書き出してください。' : memory ? 'メモリが足りないため書き出せませんでした。' : '書き出しに失敗しました。',
             detail: e instanceof Error ? e.message : String(e),
           })
         }
@@ -382,6 +421,94 @@ export function useAudioPlayer() {
     },
     [audio],
   )
+
+  /** 動画: 元の音声（処理なし）を WAV に */
+  const exportOriginalVideoAudio = useCallback(
+    async (bitDepth: WavBitDepth) => {
+      if (!audio?.video || exportRunningRef.current) return
+      exportRunningRef.current = true
+      if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current)
+      videoUrlRef.current = null
+      setVideoState({ state: 'running', kind: 'original-wav', progress: { stage: 'encoding' } })
+      try {
+        // 表示を更新させてから変換する
+        await new Promise((r) => setTimeout(r, 0))
+        const channels = Array.from({ length: audio.buffer.numberOfChannels }, (_, c) => audio.buffer.getChannelData(c))
+        // 元の音声（処理なし）。モノラルはステレオにする（書き出しはすべてステレオ）
+        const blob = encodeWav(channels.length === 1 ? [channels[0], channels[0]] : channels.slice(0, 2), { sampleRate: audio.buffer.sampleRate, bitDepth, seed: 1 }).blob
+        const url = URL.createObjectURL(blob)
+        videoUrlRef.current = url
+        const base = audio.fileName.replace(/\.[^.]+$/, '')
+        setVideoState({ state: 'complete', kind: 'original-wav', url, fileName: `${safeName(base)}_ORIGINAL_AUDIO_${bitDepth}bit.wav`, bytes: blob.size, seconds: audio.buffer.duration })
+      } catch (e) {
+        setVideoState({ state: 'error', message: '音声の書き出しに失敗しました。', detail: e instanceof Error ? e.message : String(e) })
+      } finally {
+        exportRunningRef.current = false
+      }
+    },
+    [audio],
+  )
+
+  /** 動画: 立体音響化した音声に差し替えた動画を作る（映像はコピー） */
+  const exportSpatialVideo = useCallback(
+    async (tailMode: VideoTailMode, settingsLabel: string) => {
+      const engine = engineRef.current
+      if (!engine || !audio?.video || exportRunningRef.current) return
+      exportRunningRef.current = true
+      videoCancelRef.current = false
+      if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current)
+      videoUrlRef.current = null
+      setVideoState({ state: 'running', kind: 'video', progress: { stage: 'preparing' } })
+      try {
+        const snap = await engine.exportSnapshot()
+        if (videoCancelRef.current) throw new VideoCancelledError()
+        const info = audio.video.info
+        const need = estimateVideoExportBytes(info, { frames: audio.buffer.length, channels: audio.buffer.numberOfChannels, sampleRate: audio.buffer.sampleRate }, snap.dsp.spatial)
+        const budget = exportMemoryBudget((navigator as Navigator & { deviceMemory?: number }).deviceMemory)
+        if (need > budget) throw new RangeError(`動画の書き出しに必要なメモリの見積もり（${formatBytes(need)}）が上限（${formatBytes(budget)}）を超えます。短い・小さい動画で書き出してください。`)
+        checkRetainedMemory(need, budget)
+        const { canEncodeAudio, startVideoExport } = await import('../video/videoExport')
+        const aacAvailable = await canEncodeAudio('aac', { numberOfChannels: 2, sampleRate: audio.buffer.sampleRate })
+        engine.holdAnalysis(true)
+        await engine.suspendForExport()
+        if (videoCancelRef.current) throw new VideoCancelledError()
+        const channels = Array.from({ length: audio.buffer.numberOfChannels }, (_, c) => audio.buffer.getChannelData(c))
+        const job = startVideoExport(audio.file, info, { channels, sampleRate: audio.buffer.sampleRate, startTime: audio.video.audioStart }, snap, {
+          tailMode,
+          aacAvailable,
+          onProgress: (progress) => setVideoState({ state: 'running', kind: 'video', progress }),
+        })
+        videoJobRef.current = job
+        const result = await job.promise
+        const url = URL.createObjectURL(result.blob)
+        videoUrlRef.current = url
+        const base = audio.fileName.replace(/\.[^.]+$/, '')
+        setVideoState({ state: 'complete', kind: 'video', url, fileName: `${safeName(base)}_${safeName(settingsLabel)}.${EXT_OF[info.container]}`, result, settingsLabel })
+      } catch (e) {
+        if (e instanceof VideoCancelledError || e instanceof ExportCancelledError) setVideoState({ state: 'cancelled' })
+        else {
+          const memory = e instanceof RangeError || /memory|allocation/i.test(String(e))
+          const stalled = e instanceof ExportTimeoutError || e instanceof VideoTimeoutError
+          setVideoState({
+            state: 'error',
+            message: stalled ? '動画の書き出しが途中で止まったため中止しました。もう一度書き出してください。' : memory ? 'メモリが足りないため動画を書き出せませんでした。' : '動画の書き出しに失敗しました。',
+            detail: e instanceof Error ? e.message : String(e),
+          })
+        }
+      } finally {
+        videoJobRef.current = null
+        exportRunningRef.current = false
+        engineRef.current?.holdAnalysis(false)
+        void engineRef.current?.resumeAfterExport()
+      }
+    },
+    [audio],
+  )
+
+  const cancelVideo = useCallback(() => {
+    videoCancelRef.current = true
+    videoJobRef.current?.cancel()
+  }, [])
 
   const cancelExport = useCallback(() => {
     exportCancelRef.current = true
@@ -445,6 +572,10 @@ export function useAudioPlayer() {
     saveCurrentCustom,
     deleteSavedCustom,
     exportState,
+    videoState,
+    exportOriginalVideoAudio,
+    exportSpatialVideo,
+    cancelVideo,
     originalUrl,
     exportWav,
     cancelExport,

@@ -484,8 +484,19 @@ export class AudioEngine {
    * 計画がまだなければ解析が終わるまで待つ（タイムアウトで失敗）。音源の解析に失敗している場合も失敗
    */
   async exportSnapshot(timeoutMs = 120000): Promise<ExportSnapshot> {
-    await this.ensureReady()
     const deadline = performance.now() + timeoutMs
+    // 準備（HRTF の測定・ワークレットの読み込み）も同じ上限に含める（止まったときに書き出しを待たせ続けない）
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        this.ensureReady(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('再生エンジンの準備が終わらないため書き出せません。ページを読み込み直してください。')), timeoutMs)
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
     for (let iter = 0; ; iter++) {
       if (this.dsp.analysis === 'error' || this.dsp.spatial.analysis === 'error') throw new Error('音源の解析に失敗したため書き出せません。音源を読み込み直してください。')
       const dsp = this.dspConfig()

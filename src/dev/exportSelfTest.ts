@@ -4,13 +4,15 @@
 import { AudioEngine, type ExportSnapshot } from '../audio/AudioEngine'
 import { analysisStats } from '../audio/analysisStats'
 import type { DspConfig } from '../audio/dspConfig'
-import { estimateExportBytes, EXPORT_MAX_SECONDS, exportMemoryBudget, reverbTailSeconds, type ExportProgress, type ExportRequest } from '../audio/export/exportSpec'
-import { ExportCancelledError, exportFrameCount, startExport } from '../audio/export/exportRunner'
+import { DEFAULT_EXPORT_WATCHDOG, estimateExportBytes, EXPORT_MAX_SECONDS, exportMemoryBudget, RENDER_PROGRESS_MAX_SECONDS, reverbTailSeconds, type ExportProgress, type ExportRequest, type ExportWatchdog } from '../audio/export/exportSpec'
+import { ExportCancelledError, exportFrameCount, ExportTimeoutError, pendingRetainedBytes, recentExportTraces, RETAINED_RELEASE_IDLE_MS, retainedReleaseWaitMs, startExport } from '../audio/export/exportRunner'
 import { renderExportFloat } from '../audio/export/renderExport'
 import { encodeWav, wavHeader, wavSizeError } from '../audio/export/wavEncoder'
 import { integratedLoudness, linearToDb, samplePeak } from '../audio/loudness'
 import { presetToDsp, SPATIAL_PRESETS } from '../audio/presets/spatialPresets'
 import { motionLayout } from '../audio/spatial/spatialSpec'
+import { measureHrtfLatency } from '../audio/spatial/spatialGraph'
+import { keptHrtfRates } from '../audio/hrtfKeeper'
 import { distanceDelaySeconds } from '../audio/spatial/motion'
 import { DEFAULT_SPATIAL_PARAMS } from '../audio/spatial/spatialSpec'
 import { averageSpectrum, thirdOctaveLevelsDb, THIRD_OCTAVE_CENTERS } from '../audio/spectrum'
@@ -756,6 +758,128 @@ export async function runExportSelfTest(): Promise<TestResult[]> {
     const fh = inspectAudioHeader(flac)
     check('FLAC のヘッダー（STREAMINFO）からサンプルレート・チャンネル・ビット数を読む', fh?.format === 'flac' && fh.header.sampleRate === 44100 && fh.header.channels === 2 && fh.header.bitDepth === 24, JSON.stringify(fh?.header))
     info('未検証の形式', 'FLAC・Ogg（Vorbis / Opus）・M4A（AAC）は実ファイルでのデコードを試験していない（ブラウザが対応していれば読み込める。失敗時はデコードエラーを表示）。MP3 も Phase 06 では実ファイルで再確認していない')
+  }
+
+  group = '72. 監視・打ち切り・復旧（Phase 07 の安定化）'
+  if (want(72)) {
+    // 止まった状態は試験専用の debugStall で作る（その段階の開始で戻らない Promise を待つ）。監視の時間は試験で短くする
+    const short = (s: number) => toBuffer([noise(s, 21), noise(s, 22)])
+    const fast = { prepareStallMs: 1500, renderStallMs: 1500, encodeBaseMs: 1500, encodeMsPerSecond: 0 }
+    const run = async (req: ExportRequest, watchdog: Partial<ExportWatchdog> | undefined) => {
+      const t = performance.now()
+      try {
+        const r = await startExport(req, () => {}, { watchdog }).promise
+        return { ok: true as const, r, err: null, ms: performance.now() - t }
+      } catch (e) {
+        return { ok: false as const, r: null, err: e, ms: performance.now() - t }
+      }
+    }
+    const lastTraces = (n: number) => recentExportTraces().slice(-n)
+
+    // A. 準備の段階で止まる（1 回目だけ）→ 新しいフレームで自動で 1 回作り直して完了
+    const a = await run(plainRequest(short(2), dspOf(0), { debugStall: { stage: 'hrtf', attempt: 1 } }), { ...fast, prepareRetries: 1 })
+    const ta = lastTraces(2)
+    check(
+      '準備（HRTF の測定）で止まる → 打ち切って新しいフレームで 1 回だけ自動でやり直し、完了（音源は送る前なので作り直せる）',
+      a.ok && a.r.blob.size > 44 && ta.length === 2 && ta[0].outcome === 'timeout' && ta[0].stalled?.stage === 'preparing' && ta[1].attempt === 2 && ta[1].outcome === 'done' && exportFrameCount() === 0,
+      `${a.ok ? `完了 ${a.r.blob.size} バイト` : String(a.err)}、記録 ${ta.map((t) => `${t.attempt}:${t.outcome}`).join(' / ')}、${(a.ms / 1000).toFixed(1)} 秒、フレーム ${exportFrameCount()}`,
+    )
+    // B. 準備の段階で毎回止まる → 再試行は 1 回まで（無限に繰り返さない）、ExportTimeoutError
+    const b = await run(plainRequest(short(2), dspOf(0), { debugStall: { stage: 'worklets' } }), { ...fast, prepareRetries: 1 })
+    const tb = lastTraces(2)
+    check(
+      '準備で毎回止まる → 自動のやり直しは 1 回まで、2 回目も止まれば ExportTimeoutError（準備）・フレームを削除',
+      !b.ok && b.err instanceof ExportTimeoutError && b.err.stage === 'preparing' && b.err.attempts === 2 && tb.every((t) => t.outcome === 'timeout') && exportFrameCount() === 0,
+      `${b.err instanceof Error ? `${b.err.name}: ${b.err.message}` : 'エラーなし'}、${(b.ms / 1000).toFixed(1)} 秒、フレーム ${exportFrameCount()}`,
+    )
+    // C. レンダリングで止まる（進捗が途絶える）→ 音源を送った後なので作り直さず ExportTimeoutError
+    const c = await run(plainRequest(short(2), dspOf(0), { debugStall: { stage: 'render' } }), { ...fast, prepareRetries: 1 })
+    check(
+      'レンダリングで進捗が途絶える → ExportTimeoutError（レンダリング）、やり直さない（音源は転送済み）・フレームを削除',
+      !c.ok && c.err instanceof ExportTimeoutError && c.err.stage === 'rendering' && c.err.attempts === 1 && lastTraces(1)[0].outcome === 'timeout' && exportFrameCount() === 0,
+      `${c.err instanceof Error ? `${c.err.name}: ${c.err.message}` : 'エラーなし'}、${(c.ms / 1000).toFixed(1)} 秒`,
+    )
+    // D. エンコードで止まる → ExportTimeoutError（エンコード）
+    const d = await run(plainRequest(short(2), dspOf(0), { debugStall: { stage: 'encode' } }), fast)
+    check(
+      'WAV エンコードで止まる → ExportTimeoutError（エンコード）・フレームを削除',
+      !d.ok && d.err instanceof ExportTimeoutError && d.err.stage === 'encoding' && exportFrameCount() === 0,
+      `${d.err instanceof Error ? `${d.err.name}: ${d.err.message}` : 'エラーなし'}、${(d.ms / 1000).toFixed(1)} 秒`,
+    )
+    // E. 打ち切りの後に、もう一度正常に書き出せる（WAV のヘッダー・長さ）
+    const e = await run(plainRequest(short(2), dspOf(0)), undefined)
+    const head = e.ok ? inspectAudioHeader(new Uint8Array(await e.r.blob.slice(0, 64).arrayBuffer())) : null
+    check(
+      '打ち切りの後の書き出しは正常に完了（RIFF / WAVE・2ch・16-bit・長さ = 音源 + 余韻）',
+      e.ok && head?.format === 'wav' && head.header.channels === 2 && head.header.bitDepth === 16 && e.r.sourceSeconds > 1.99 && exportFrameCount() === 0,
+      e.ok ? `${e.r.blob.size} バイト、${head?.format} ${head?.header.channels}ch ${head?.header.bitDepth}-bit、音源 ${f2(e.r.sourceSeconds)} 秒 + 余韻 ${f2(e.r.tailSeconds)} 秒` : String(e.err),
+    )
+    // F. 記録: 段階がすべて開始・完了の順にそろう。処理 ID・ブラウザ・入力条件を含み、音声の内容・ファイル名を含まない
+    const tf = lastTraces(1)[0]
+    const want11 = ['frame', 'init', 'hrtf', 'context', 'worklets', 'transfer', 'chain', 'render-start', 'render', 'encode', 'return'] as const
+    const ok11 = want11.every((s) => tf.events.some((x) => x.stage === s && x.phase === 'start') && tf.events.some((x) => x.stage === s && x.phase === 'end'))
+    const text = JSON.stringify(tf)
+    check(
+      '記録: 11 の段階の開始・完了、処理 ID・ブラウザ・入力条件（サンプルレート・長さ・モード）。音声のサンプル値・ファイル名を含まない（1 KB 前後）',
+      ok11 && /^export-\d+$/.test(tf.id) && /^(Edge|Chrome) \d+$/.test(tf.browser) && tf.input.sampleRate === RATE && Math.abs(tf.input.seconds - 2) < 0.01 && text.length < 4000 && !/\.(wav|mp3|mp4|webm)/i.test(text),
+      `${tf.id} ${tf.browser}、${tf.events.length} 件・${text.length} 文字、段階ごとの完了時刻（ms）: ${want11.map((s) => `${s} ${tf.events.filter((x) => x.stage === s && x.phase === 'end').pop()?.t ?? '-'}`).join('、')}`,
+    )
+    // G. 正常な長い書き出しを止めない: 60 秒（IMMERSIVE X）の進捗の間隔の最大と、監視の上限（既定値）の比
+    const gaps: number[] = []
+    let lastT = performance.now()
+    const g = await startExport(plainRequest(short(60), dspOf(3)), (p) => {
+      if (p.stage !== 'rendering') return
+      const now = performance.now()
+      gaps.push(now - lastT)
+      lastT = now
+    }).promise
+    const maxGap = Math.max(...gaps)
+    check(
+      '正常な 60 秒の書き出し（IMMERSIVE X）は既定の監視で止まらない: 進捗の間隔の最大がレンダリングの上限（60 秒）の 1/4 未満・進捗は音声 5 秒ごと以下',
+      g.blob.size > 44 && maxGap < DEFAULT_EXPORT_WATCHDOG.renderStallMs / 4 && gaps.length >= 60 / RENDER_PROGRESS_MAX_SECONDS,
+      `進捗 ${gaps.length} 回、間隔の最大 ${(maxGap / 1000).toFixed(2)} 秒、レンダリング ${(g.renderMs / 1000).toFixed(1)} 秒`,
+    )
+    // I. 書き出しの後にしばらく残るメモリの見積もり: 直後は出力 1 本分以上、書き出しのない時間が 45 秒続けば 0 と見なす
+    const pend = pendingRetainedBytes()
+    const out60 = 60 * RATE * 2 * 4
+    check(
+      '直後の書き出しの残りの見積もり ≥ 60 秒の出力 1 本分（次の書き出しのメモリの上限の判定に足す）・45 秒後は 0',
+      pend >= out60 && pendingRetainedBytes(performance.now() + RETAINED_RELEASE_IDLE_MS + 1000) === 0,
+      `直後 ${(pend / 2 ** 20).toFixed(0)} MB（60 秒の出力 ${(out60 / 2 ** 20).toFixed(0)} MB）、待ち時間の目安 ${(retainedReleaseWaitMs() / 1000).toFixed(0)} 秒`,
+    )
+    // J. HRTF のデータを書き出すサンプルレートで保持している（Edge で準備の段階で止まる問題の対策）
+    check('書き出したサンプルレートの HRTF のデータを親ウィンドウで保持（Edge の停止の対策）', keptHrtfRates().includes(RATE), `保持 ${keptHrtfRates().join(' / ')} Hz`)
+    // K. ページ内の HRTF の遅延の測定が止まる（再生エンジンの準備・解析で使う）→ 新しい文脈で 1 回やり直して測れる
+    {
+      const sr = 32000
+      const orig = OfflineAudioContext.prototype.startRendering
+      let stalled = 0
+      OfflineAudioContext.prototype.startRendering = function (this: OfflineAudioContext) {
+        if (stalled === 0 && this.sampleRate === sr && this.length === Math.round(sr * 0.1)) {
+          stalled++
+          return new Promise<AudioBuffer>(() => {})
+        }
+        return orig.call(this)
+      }
+      const t = performance.now()
+      let lat: number | string
+      try {
+        lat = await measureHrtfLatency(sr)
+      } catch (e) {
+        lat = String(e)
+      } finally {
+        OfflineAudioContext.prototype.startRendering = orig
+      }
+      const ms = performance.now() - t
+      check(
+        'ページ内の HRTF の遅延の測定が止まる → 10 秒で打ち切って新しい文脈で 1 回やり直し、測れる（エンジンの準備が止まり続けない）',
+        stalled === 1 && typeof lat === 'number' && lat >= 0 && ms < 15000,
+        `止めた回数 ${stalled}、結果 ${typeof lat === 'number' ? `${(lat * 1000).toFixed(2)} ms` : lat}、${(ms / 1000).toFixed(1)} 秒`,
+      )
+    }
+    // H. 準備の各段階の所要時間（参考。監視の上限 30 秒との比較）
+    const prep = recentExportTraces().filter((t) => t.outcome === 'done').map((t) => (t.events.find((x) => x.stage === 'render-start' && x.phase === 'end')?.t ?? NaN) - (t.events.find((x) => x.stage === 'frame' && x.phase === 'start')?.t ?? NaN))
+    info('準備（フレームの生成〜startRendering）の所要時間（ms、この試験の完了した書き出し）', prep.map((v) => v.toFixed(0)).join(' / '))
   }
 
   releaseShared()

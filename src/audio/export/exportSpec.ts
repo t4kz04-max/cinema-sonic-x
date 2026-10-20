@@ -86,11 +86,67 @@ export interface ExportRequest {
   wideSideCapDb: number
   bitDepth: WavBitDepth
   ditherSeed: number
-  /** 試験用: 量子化前の浮動小数点の結果も返す */
+  /** 量子化前の浮動小数点の結果も返す（試験用・動画の音声差し替え用） */
   returnFloat?: boolean
+  /** false: WAV を作らない（動画の音声差し替えでは浮動小数点の結果だけを使う。既定 true） */
+  encodeWav?: boolean
+  /**
+   * 試験専用: この段階の開始で処理を止めたままにする（監視・打ち切り・復旧の試験用。UI からは使わない）。
+   * attempt を付けると、その回の試行だけ止める（自動の再試行の試験）
+   */
+  debugStall?: { stage: ExportTraceStage; attempt?: number }
 }
 
 export type ExportStage = 'preparing' | 'rendering' | 'encoding'
+
+/**
+ * 書き出しの処理段階（記録用）。親: frame（iframe の生成）・init（フレームの初期化 = ready を受け取るまで）・transfer（音源の受け渡し）・return（結果の受け取り）。
+ * フレーム内: hrtf（HRTF の遅延の測定）・context（OfflineAudioContext の作成）・worklets（AudioWorklet モジュールの読み込み）・
+ * chain（DSP チェーンの構築）・render-start（startRendering の呼び出し）・render（レンダリング完了まで）・encode（WAV エンコード）
+ */
+export type ExportTraceStage = 'frame' | 'init' | 'transfer' | 'hrtf' | 'context' | 'worklets' | 'chain' | 'render-start' | 'render' | 'encode' | 'return'
+
+export interface ExportTraceEvent {
+  stage: ExportTraceStage
+  phase: 'start' | 'end' | 'fail'
+  /** 書き出しの開始からの経過時間（ms、親ウィンドウの時計） */
+  t: number
+  /** 補足（モジュール名・エラー名など。音声の内容・ファイル名は入れない） */
+  detail?: string
+}
+
+/** 1 回の書き出しの記録（音声の内容・ファイル名は含まない） */
+export interface ExportTrace {
+  id: string
+  /** 何回目の試行か（自動の再試行で 2） */
+  attempt: number
+  browser: string
+  input: { sampleRate: number; channels: number; seconds: number; spatialMode: string; motion: boolean; bassEnabled: boolean; returnFloat: boolean; encodeWav: boolean }
+  events: ExportTraceEvent[]
+  outcome: 'running' | 'done' | 'cancelled' | 'timeout' | 'error'
+  /** 打ち切ったとき: 止まっていた段階と、進まなかった時間（ms） */
+  stalled?: { stage: ExportStage; ms: number }
+}
+
+/**
+ * 書き出しの監視の時間（ms）。進捗（段階の記録・レンダリングの割合）が届くたびに数え直すので、長い音源でも正常な処理は止めない。
+ * - prepareStallMs: 準備（フレームの初期化〜startRendering）で、段階の記録が届かない時間の上限。通常は数秒以内（実測は下記の記録）
+ * - renderStallMs: レンダリング中に割合が届かない時間の上限。割合は最大 RENDER_PROGRESS_MAX_SECONDS の音声ごとに届く
+ * - encodeBaseMs / encodeMsPerSecond: WAV エンコード〜結果の受け取りの上限（同期処理で途中の進捗がないため、音声の長さに比例させる）
+ */
+export interface ExportWatchdog {
+  prepareStallMs: number
+  renderStallMs: number
+  encodeBaseMs: number
+  encodeMsPerSecond: number
+  /** 準備の段階で打ち切ったときの自動の再試行の回数（音源を送る前に止まった場合だけ。無限には繰り返さない） */
+  prepareRetries: number
+}
+
+export const DEFAULT_EXPORT_WATCHDOG: ExportWatchdog = { prepareStallMs: 30000, renderStallMs: 60000, encodeBaseMs: 60000, encodeMsPerSecond: 200, prepareRetries: 1 }
+
+/** レンダリングの進捗を測る間隔の上限（音声の秒）。長い音源でも進捗が一定の間隔で届くようにする（監視のため） */
+export const RENDER_PROGRESS_MAX_SECONDS = 5
 
 export interface ExportProgress {
   stage: ExportStage

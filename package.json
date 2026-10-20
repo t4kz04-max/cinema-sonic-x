@@ -12,9 +12,12 @@
     "test:spatial": "node scripts/run-dsp-selftest.mjs --spatial",
     "test:tail": "node scripts/run-dsp-selftest.mjs --tail",
     "test:preset": "node scripts/run-dsp-selftest.mjs --preset",
-    "test:export": "node scripts/run-dsp-selftest.mjs --export"
+    "test:export": "node scripts/run-dsp-selftest.mjs --export",
+    "test:video": "node scripts/run-dsp-selftest.mjs --video",
+    "test:video:diagnostic": "node scripts/run-dsp-selftest.mjs --video-diagnostic"
   },
   "dependencies": {
+    "mediabunny": "1.61.3",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

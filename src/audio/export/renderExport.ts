@@ -17,7 +17,17 @@ import { computeEnvelope } from '../spatial/motionEnvelope'
 import { loadMotionWorklet, measureHrtfLatency } from '../spatial/spatialGraph'
 import { isMotionActive } from '../spatial/spatialSpec'
 import { loadTailWorklet } from '../spatial/tailEngine'
-import { END_FADE_SECONDS, renderSeconds, TAIL_KEEP_AFTER_SECONDS, TAIL_SILENCE_THRESHOLD, type ExportProgress, type ExportRequest, type ExportResult } from './exportSpec'
+import {
+  END_FADE_SECONDS,
+  RENDER_PROGRESS_MAX_SECONDS,
+  renderSeconds,
+  TAIL_KEEP_AFTER_SECONDS,
+  TAIL_SILENCE_THRESHOLD,
+  type ExportProgress,
+  type ExportRequest,
+  type ExportResult,
+  type ExportTraceStage,
+} from './exportSpec'
 import { encodeWav } from './wavEncoder'
 
 /** 進捗を測るための suspend の回数（多すぎるとレンダリングが遅くなる） */
@@ -33,26 +43,97 @@ export interface RenderedExport {
   renderMs: number
 }
 
+/** 段階の記録（開始・完了・失敗）。音声の内容は渡さない */
+export type TraceFn = (stage: ExportTraceStage, phase: 'start' | 'end' | 'fail', detail?: string) => void
+
+/** 試験専用の停止（debugStall）: 指定の段階の開始で、戻らない Promise を待つ */
+const stallIf = (req: Pick<ExportRequest, 'debugStall'>, stage: ExportTraceStage, attempt: number) =>
+  req.debugStall && req.debugStall.stage === stage && (req.debugStall.attempt === undefined || req.debugStall.attempt === attempt) ? new Promise<never>(() => {}) : Promise.resolve()
+
+/** 段階を記録しながら実行する（失敗したら fail を記録してそのまま投げる） */
+async function step<T>(trace: TraceFn, stage: ExportTraceStage, fn: () => T | Promise<T>, detail?: string): Promise<T> {
+  trace(stage, 'start', detail)
+  try {
+    const v = await fn()
+    trace(stage, 'end', detail)
+    return v
+  } catch (e) {
+    trace(stage, 'fail', e instanceof Error ? `${e.name}: ${e.message}`.slice(0, 200) : 'error')
+    throw e
+  }
+}
+
+/** 準備済みの文脈（音源を受け取る前に作れる部分） */
+export interface PreparedRender {
+  ctx: OfflineAudioContext
+  hrtfLatency: number
+  motionOk: boolean
+  totalFrames: number
+}
+
+/**
+ * 準備: HRTF の遅延の測定 → OfflineAudioContext の作成 → AudioWorklet の読み込み。音源の PCM は使わない
+ * （音源の長さだけで決まる）ので、音源を送る前に済ませられる
+ */
+export async function prepareRender(req: Omit<ExportRequest, 'channels'> & { frames: number }, trace: TraceFn = () => {}, attempt = 1): Promise<PreparedRender> {
+  const sr = req.sampleRate
+  const sourceSeconds = req.frames / sr
+  const hrtfLatency = await step(trace, 'hrtf', async () => {
+    await stallIf(req, 'hrtf', attempt)
+    return measureHrtfLatency(sr)
+  })
+  // 遅延（先頭の切り捨て量）はチェーンを作ってから正確に分かるため、まず上限で長さを決める（Motion の STFT + HRTF + 先読み 2 段）
+  const maxHead = 4096 / sr + hrtfLatency + 0.02
+  const totalFrames = Math.ceil(renderSeconds(sourceSeconds, maxHead, req.dsp.spatial) * sr)
+  const ctx = await step(trace, 'context', async () => {
+    await stallIf(req, 'context', attempt)
+    return new OfflineAudioContext(2, totalFrames, sr)
+  })
+  let motionOk = false
+  await step(trace, 'worklets', async () => {
+    await stallIf(req, 'worklets', attempt)
+    // モジュールごとに記録する（どの読み込みで止まったかを分けるため）
+    if (!(await step(trace, 'worklets', () => loadDynamicsWorklet(ctx), 'bassDynamics'))) throw new Error('AudioWorklet を読み込めませんでした（書き出しには AudioWorklet が必要です）')
+    await step(trace, 'worklets', () => loadTailWorklet(ctx), 'tail')
+    motionOk = await step(trace, 'worklets', () => loadMotionWorklet(ctx), 'motion')
+    await step(trace, 'worklets', () => loadAlignWorklet(ctx), 'align')
+  })
+  if (isMotionActive(req.dsp.spatial) && !motionOk) throw new Error('Motion の AudioWorklet を読み込めませんでした')
+  return { ctx, hrtfLatency, motionOk, totalFrames }
+}
+
+/** レンダリングの追加の指定（フレーム内で使う） */
+export interface RenderOptions {
+  trace?: TraceFn
+  /** 準備済みの文脈（prepareRender の結果）。省略時はここで準備する */
+  prepared?: PreparedRender
+  attempt?: number
+  /**
+   * true: 音源の PCM を AudioBuffer に写した後、要求の配列から外す（req.channels を空にする）。
+   * 書き出し用フレームでは要求は使い捨てなので外してよい。呼び出し側の配列を使い続ける場合は false（既定）
+   */
+  releaseInput?: boolean
+}
+
 /** オフラインレンダリング（WAV にする前の浮動小数点の結果） */
-export async function renderExportFloat(req: ExportRequest, onProgress: (p: ExportProgress) => void = () => {}): Promise<RenderedExport> {
+export async function renderExportFloat(req: ExportRequest, onProgress: (p: ExportProgress) => void = () => {}, opts: RenderOptions = {}): Promise<RenderedExport> {
+  const { trace = () => {}, attempt = 1 } = opts
   onProgress({ stage: 'preparing' })
   const sr = req.sampleRate
   const srcFrames = req.channels[0].length
   const sourceSeconds = srcFrames / sr
-  const hrtfLatency = await measureHrtfLatency(sr)
-  // 遅延（先頭の切り捨て量）はチェーンを作ってから正確に分かるため、まず上限で長さを決める（Motion の STFT + HRTF + 先読み 2 段）
-  const maxHead = 4096 / sr + hrtfLatency + 0.02
-  const totalFrames = Math.ceil(renderSeconds(sourceSeconds, maxHead, req.dsp.spatial) * sr)
-  const ctx = new OfflineAudioContext(2, totalFrames, sr)
-  if (!(await loadDynamicsWorklet(ctx))) throw new Error('AudioWorklet を読み込めませんでした（書き出しには AudioWorklet が必要です）')
-  await loadTailWorklet(ctx)
-  const motionOk = await loadMotionWorklet(ctx)
-  await loadAlignWorklet(ctx)
-  if (isMotionActive(req.dsp.spatial) && !motionOk) throw new Error('Motion の AudioWorklet を読み込めませんでした')
-  const envelope = isMotionActive(req.dsp.spatial) ? computeEnvelope(req.channels, sr, req.dsp.spatial.motionSpeed / 100) : null
+  const { ctx, hrtfLatency, motionOk, totalFrames } = opts.prepared ?? (await prepareRender({ ...req, frames: srcFrames }, trace, attempt))
 
-  const source = new AudioBuffer({ length: srcFrames, numberOfChannels: req.channels.length, sampleRate: sr })
-  req.channels.forEach((d, c) => source.copyToChannel(d as Float32Array<ArrayBuffer>, c))
+  const { source, envelope } = await step(trace, 'chain', async () => {
+    await stallIf(req, 'chain', attempt)
+    const envelope = isMotionActive(req.dsp.spatial) ? computeEnvelope(req.channels, sr, req.dsp.spatial.motionSpeed / 100) : null
+    const source = new AudioBuffer({ length: srcFrames, numberOfChannels: req.channels.length, sampleRate: sr })
+    req.channels.forEach((d, c) => source.copyToChannel(d as Float32Array<ArrayBuffer>, c))
+    // 写した後の音源の配列（3 分で 約 69 MB）を手放し、レンダリング中のピークを下げる（AudioBuffer に写したので不要）
+    if (opts.releaseInput) req.channels.length = 0
+    return { source, envelope }
+  }, 'source')
+  trace('chain', 'start', 'graph')
   const chain = createOutputChain(ctx, {
     dsp: req.dsp,
     bypass: false,
@@ -74,20 +155,31 @@ export async function renderExportFloat(req: ExportRequest, onProgress: (p: Expo
   chain.output.connect(ctx.destination)
   const headTrimSeconds = chain.bass.latencySeconds * (req.dsp.bassEnabled ? 1 : 0) + chain.spatial.processingLatencySeconds()
   const head = Math.round(headTrimSeconds * sr)
+  trace('chain', 'end', 'graph')
 
-  // 進捗: 一定間隔で suspend し、そこまでレンダリングし終えた割合を通知する（推定ではなく実際に描画済みの時刻）
-  const step = Math.max(RENDER_QUANTUM, Math.ceil(totalFrames / PROGRESS_STEPS / RENDER_QUANTUM) * RENDER_QUANTUM)
-  for (let f = step; f < totalFrames; f += step) {
+  // 進捗: 一定間隔で suspend し、そこまでレンダリングし終えた割合を通知する（推定ではなく実際に描画済みの時刻）。
+  // 間隔は全体の 1/40、ただし音声 RENDER_PROGRESS_MAX_SECONDS 秒ごと以下（長い音源でも進捗が一定の間隔で届き、止まったことを検出できる）
+  const quanta = (frames: number) => Math.max(RENDER_QUANTUM, Math.floor(frames / RENDER_QUANTUM) * RENDER_QUANTUM)
+  const stepFrames = Math.min(Math.max(RENDER_QUANTUM, Math.ceil(totalFrames / PROGRESS_STEPS / RENDER_QUANTUM) * RENDER_QUANTUM), quanta(RENDER_PROGRESS_MAX_SECONDS * sr))
+  for (let f = stepFrames; f < totalFrames; f += stepFrames) {
     void ctx.suspend(f / sr).then(() => {
       onProgress({ stage: 'rendering', rendered: f / totalFrames })
       void ctx.resume()
     })
   }
   node.start(0)
+  await step(trace, 'render-start', () => stallIf(req, 'render-start', attempt))
   onProgress({ stage: 'rendering', rendered: 0 })
   const t0 = performance.now()
-  const out = await ctx.startRendering()
+  trace('render', 'start')
+  // 試験専用: レンダリングの段階で止める（進捗 0 のまま途絶えた状態）
+  await stallIf(req, 'render', attempt)
+  const out = await ctx.startRendering().catch((e: unknown) => {
+    trace('render', 'fail', e instanceof Error ? e.name : 'error')
+    throw e
+  })
   const renderMs = performance.now() - t0
+  trace('render', 'end')
   onProgress({ stage: 'rendering', rendered: 1 })
 
   // 先頭の処理の遅延を切り捨て、末尾は余韻がしきい値を下回った所まで（音源の長さより短くはしない）
@@ -114,10 +206,14 @@ export async function renderExportFloat(req: ExportRequest, onProgress: (p: Expo
 }
 
 /** レンダリング → WAV */
-export async function renderExport(req: ExportRequest, onProgress: (p: ExportProgress) => void = () => {}): Promise<ExportResult> {
-  const r = await renderExportFloat(req, onProgress)
+export async function renderExport(req: ExportRequest, onProgress: (p: ExportProgress) => void = () => {}, opts: RenderOptions = {}): Promise<ExportResult> {
+  const { trace = () => {}, attempt = 1 } = opts
+  const r = await renderExportFloat(req, onProgress, opts)
   onProgress({ stage: 'encoding' })
-  const { blob, stats } = encodeWav(r.channels, { sampleRate: req.sampleRate, bitDepth: req.bitDepth, dither: true, seed: req.ditherSeed })
+  const { blob, stats } = await step(trace, 'encode', async () => {
+    await stallIf(req, 'encode', attempt)
+    return req.encodeWav === false ? { blob: new Blob([]), stats: { clippedSamples: 0, dataBytes: 0 } } : encodeWav(r.channels, { sampleRate: req.sampleRate, bitDepth: req.bitDepth, dither: true, seed: req.ditherSeed })
+  })
   return {
     blob,
     sampleRate: req.sampleRate,
