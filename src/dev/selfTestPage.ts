@@ -3,6 +3,8 @@ import { runMotionCpuTest, runMotionSelfTest } from './motionSelfTest'
 import { runExportSelfTest } from './exportSelfTest'
 import { runVideoSelfTest } from './videoSelfTest'
 import { runPresetCpuTest, runPresetSelfTest } from './presetSelfTest'
+import { runQualityReport } from './qualityReport'
+import { runHrtfStress } from './hrtfStress'
 import { runSpatialSelfTest } from './spatialSelfTest'
 import { runTailBaseline } from './tailBaseline'
 import { runTailCpuTest, runTailSelfTest } from './tailSelfTest'
@@ -38,6 +40,8 @@ const SUITES: Record<string, () => Promise<TestResult[]>> = {
   presetcpu: runPresetCpuTest,
   export: runExportSelfTest,
   video: runVideoSelfTest,
+  quality: runQualityReport,
+  hrtfstress: runHrtfStress,
 }
 const suite = (suiteName && SUITES[suiteName]) || runDspSelfTest
 suite()

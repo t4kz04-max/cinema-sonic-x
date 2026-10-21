@@ -52,6 +52,8 @@ const STAT_TC = 0.12
 /** 位置の平滑化時定数（パラメーター変更時の急な移動を防ぐ） */
 const POSITION_TC = 0.15
 const CONTROL = 16
+/** そろえ直しの判定に使う無音のしきい値（前段のフィルターの減衰の端数を無音とみなす） */
+const SILENT = 1e-9
 const MAX_DELAY = 4096
 /** Motion OFF 後もフェードアウトのために処理を続ける時間（秒）。その後は処理を止めて CPU を使わない */
 const IDLE_AFTER_SECONDS = 0.5
@@ -113,6 +115,16 @@ class MotionProcessor extends AudioWorkletProcessor {
   private readonly actCount = new Int32Array(SOURCE_COUNT)
   /** 無相関な信号でもコヒーレンス推定値が 0 にならない分（平均フレーム数による偏り）の補正 */
   private readonly cohBias: number
+  /**
+   * STFT のフレームの区切りをメディア時刻にそろえる要求（Phase 09）。書き出し（時刻 0 から描画）では区切りがメディアのサンプル
+   * 0, H, 2H… にあるが、実時間の再生ではワークレットを作った時刻から数えるため区切りがずれ、出力のサンプルが変わっていた
+   * （統計的な指標は一致、サンプル単位の差 −35〜−39 dB。docs/SPATIAL.md）。再生の開始で、入力が無音の間だけそろえ直す。
+   * 再生開始の通知（port のメッセージ）が音より先に届いたときだけ効く（先に音が入ると、無音の条件を満たさずそろえない。
+   * そろった回は各区間 −83〜−92 dB、そろわない回は修正前と同じ。Phase 09 の測定）
+   */
+  private alignPending = true
+  /** 入力が続けて無音だったサンプル数（そろえ直しは STFT・距離の遅延線に音が残っていないときだけ行う） */
+  private silentRun = 0
   // 休止（Motion OFF 時は処理しない）
   private idle = false
   private idleCountdown = 0
@@ -182,9 +194,12 @@ class MotionProcessor extends AudioWorkletProcessor {
         if (m.control.enabled && this.idle) this.wake()
         else if (!m.control.enabled && wasEnabled) this.idleCountdown = Math.round(IDLE_AFTER_SECONDS * sampleRate) + N
       } else if (m.type === 'transport') {
+        const wasPlaying = this.transport.playing
         this.transport = m.transport
         // 再生開始・シーク時は平滑化をやめて正確な位置へ移る（再生位置から常に同じ位置を再現する）
         this.snap = true
+        // 停止 → 再生のときは STFT の区切りもメディア時刻にそろえる（再生中のシークはクロスフェード中の音を崩すのでそろえない）
+        if (m.transport.playing && !wasPlaying) this.alignPending = true
       } else if (m.type === 'envelope') {
         this.envelope = m.envelope
       }
@@ -207,6 +222,27 @@ class MotionProcessor extends AudioWorkletProcessor {
     this.lpState.fill(0)
     this.ctrlCount = 0
     this.snap = true
+  }
+
+  /**
+   * STFT・距離処理の状態を初期状態に戻し、フレームの区切りと制御点の間隔をメディアのサンプル位置 p にそろえる
+   * （書き出しは時刻 0 の初期状態から描画するので、無音から再生を始めたときに同じ状態になる）
+   */
+  private alignTo(p: number): void {
+    this.inL.fill(0)
+    this.inR.fill(0)
+    for (const a of this.acc) a.fill(0)
+    for (const q of this.outQ) q.fill(0)
+    for (const d of this.dl) d.fill(0)
+    this.pll.fill(0)
+    this.prr.fill(0)
+    this.plrRe.fill(0)
+    this.plrIm.fill(0)
+    this.lpState.fill(0)
+    this.fill = ((p % H) + H) % H
+    this.ctrlCount = ((p % CONTROL) + CONTROL) % CONTROL
+    this.snap = true
+    this.alignPending = false
   }
 
   /** 出力中の音に対応するメディア時刻（STFT の遅延分だけ前。ループ中は区間で折り返す） */
@@ -424,6 +460,13 @@ class MotionProcessor extends AudioWorkletProcessor {
     for (let i = 0; i < frames; i++) {
       const l = L ? L[i] : 0
       const r = R ? R[i] : 0
+      if (Math.abs(l) < SILENT && Math.abs(r) < SILENT) this.silentRun++
+      else this.silentRun = 0
+      if (this.alignPending && this.transport.playing) {
+        // 入力が N + H 以上続けて無音（STFT のバッファ・出力の待ち行列に音がない）ならそろえ直す。音が残っていれば今回はそろえない
+        if (this.silentRun >= N + H) this.alignTo(Math.round((currentTime + i / sampleRate - this.transport.startedAt) * sampleRate))
+        else this.alignPending = false
+      }
       if (this.ctrlCount === 0) this.updateControl(i)
       const frac = this.ctrlCount / CONTROL
       this.ctrlCount = (this.ctrlCount + 1) % CONTROL

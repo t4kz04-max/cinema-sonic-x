@@ -77,7 +77,7 @@ const suites = named
               'export&groups=72-72',
             ]
           : process.argv.includes('--video')
-            ? ['video&groups=80-82', 'video&groups=83-84', 'video&groups=85-85', 'video&groups=86-87', 'video&groups=88-88', 'video&groups=89-90']
+            ? ['video&groups=80-82', 'video&groups=83-84', 'video&groups=85-85', 'video&groups=86-87', 'video&groups=88-88', 'video&groups=89-90', 'video&groups=91-91']
             : process.argv.includes('--video-diagnostic')
               ? ['video&groups=98-98&mode=export&rounds=4', 'video&groups=98-98&mode=cancel&rounds=3']
               : ['']

@@ -49,6 +49,7 @@ src/
                        wavEncoder: WAV（16-bit TPDF ディザ・24-bit）/ exportRunner + exportFrame: 使い捨て iframe での実行・キャンセル・
                        段階の記録と監視（打ち切り・準備での 1 回の自動やり直し）・書き出しの後に残るメモリの見積もり）
     hrtfKeeper.ts      HRTF のデータの保持（サンプルレートごと。Edge で HRTF の OfflineAudioContext が止まる問題の対策）
+    analysisFrame/     Phase 09: 処理計画の解析を使い捨ての iframe（analysis-frame.html）で行う（analysisHost: 親側・3 秒使わないと削除・監視とやり直し / analysisFrame: フレーム側 / analysisProtocol）
     loopRegion.ts      ループ区間（SPATIAL LOOP は音楽が鳴っている区間）
     stereoMetrics.ts   位相相関・ステレオ幅・モノラル和の測定（純粋関数）
   video/       Phase 07 の動画（React 非依存。mediabunny + WebCodecs、動画を読み込んだときだけ遅延読み込み）
@@ -77,7 +78,7 @@ docs/PHASES.md 開発計画
 - 書き出しは使い捨ての iframe（export-frame.html）で行い、終わったら（キャンセルも）iframe ごと削除する（Chrome が AudioWorklet を読み込んだ OfflineAudioContext を解放しないため）。ページ内で書き出し用の OfflineAudioContext を作らない。
 - 書き出しは exportRunner の監視（段階の記録が届かない: 準備 30 秒 / 進捗が届かない: レンダリング 60 秒 / エンコード 60 秒 + 音声 1 秒あたり 0.2 秒 / 動画の書き込み 60 秒）を通す。自動のやり直しは準備の段階・音源を送る前だけ 1 回まで（無限に繰り返さない）。フレームへの要求は prepare（音源なし）→ render（音源を転送）の 2 段階を保つ（やり直しで音源のコピーを持たないため）。レンダリングの進捗は音声 5 秒ごと以下で届ける（長い音源で監視が誤って止めないため）。段階の記録・ログに音声のサンプル値・ファイル名を入れない。
 - HRTF の PannerNode を使う OfflineAudioContext をレンダリングする前に、そのサンプルレートの HRTF のデータを保持する（hrtfKeeper.keepHrtfLoaded。measureHrtfLatency・startExport は内部で呼ぶ）。Edge で保持しないとレンダリングが止まることがある（原因は未確定。docs/SPATIAL.md）。
-- 書き出しの後、ページ内に解析の文脈があるとレンダリングの出力 1 本分のメモリが 20〜40 秒残る。新しい書き出しのメモリの判定には pendingRetainedBytes を足す。
+- 処理計画の解析（analyzeSource / planProcessing / analyzeSpatialSource / planSpatial）は、AudioEngine から AnalysisHost を通して解析用フレームで行う。ページで AudioWorklet を読み込んだ OfflineAudioContext を作らない（Chrome が解放せず、解析のたびにメモリが残る。書き出しの後に出力 1 本分が残る条件でもあった。Phase 09 で解消: 3 分の素材でプリセット 20 回の後 −172〜−229 MB）。ページに残してよい文脈は hrtfKeeper・measureHrtfLatency（ワークレットなし）だけ。新しい書き出しのメモリの判定には pendingRetainedBytes を足す（安全側の見積もりとして残している）。
 - 長く残るリスナー（AbortSignal など）は、大きな配列を捕まえる関数の中で作らない（同じ関数のクロージャーは捕まえた変数を共有し、リスナーが残る間その配列が解放されない。Phase 07 で 約 84 MB 残った）。小さな関数で作り、終わったら外す。
 - 書き出しの前に再生側の AudioContext を止める（AudioEngine.suspendForExport）。Chrome では別の AudioContext が HRTF を処理していると、OfflineAudioContext の HRTF の結果が回ごとに変わる。書き出し以外で AudioContext を止めない（止めている間はブラウザが切り離したノードを解放せず、設定の変更のたびに畳み込みのメモリが積み上がる）。
 - 書き出しの余韻の長さは設定の IR の長さ・プリディレイから決め（exportSpec.reverbTailSeconds）、固定値にしない。先頭は処理の遅延を切り捨て、末尾は −100 dBFS を下回ってから 150 ms 後で切って 20 ms フェード。
@@ -131,10 +132,13 @@ docs/PHASES.md 開発計画
 - `npm run lint`（oxlint）で警告を確認する。
 - 空間処理を変更したら `npm run test:spatial`（空間音響＋Motion）と `npm run test:tail`（Phase 04）を実行する。各スイートは別々のヘッドレスブラウザで順に実行される（Chrome が解析用の OfflineAudioContext を解放しないため）。空きメモリが 400 MB 未満になると中断する（`CSX_MIN_FREE_MB` で変更）。メモリに余裕があるときに 1 つずつ実行する。個別実行: `node scripts/run-dsp-selftest.mjs --suite=<motion|tail|cpu|tailcpu|baseline|preset|presetcpu|export|video> [--query=groups=26-32] [--log]`。
 - 書き出しを変更したら `npm run test:export`（Phase 06。WAV・余韻・Motion の再現・リアルタイムとの一致・メモリ・キャンセル・監視と打ち切り（グループ 72）。9 セッション）を実行する。
-- 動画の処理を変更したら `npm run test:video`（Phase 07。読み込み・抽出・WAV・ストリームコピー・同期・余韻・キャンセル・メモリ・プレビュー・監視と打ち切り（グループ 90）。6 セッション）を実行する。試験の動画は WebCodecs で生成する（src/dev/videoFixtures.ts）。グループ 88 のメモリは既知の FAIL（リークではなく書き出しの後 20〜40 秒の一時的な保持。docs/SPATIAL.md）。メモリの内訳の診断（グループ 98、合否なし）は通常の test:video に含めず `npm run test:video:diagnostic` で実行する。試験用のページの調査用の指定: `nohrtfkeeper=1`（HRTF の保持なしで比較）・`traceaudio=1`（ページ内のレンダリングの開始・完了を出す）。
+- 動画の処理を変更したら `npm run test:video`（Phase 07。読み込み・抽出・WAV・ストリームコピー・同期・余韻・キャンセル・メモリ・プレビュー・監視と打ち切り（グループ 90）・サンプルレート / フレームレート / 解像度の違い（グループ 91）。7 セッション）を実行する。試験の動画は WebCodecs で生成する（src/dev/videoFixtures.ts）。グループ 88 のメモリは Phase 09 で PASS になった（解析を解析用フレームへ移した。docs/SPATIAL.md）。メモリの内訳の診断（グループ 98、合否なし）は通常の test:video に含めず `npm run test:video:diagnostic` で実行する。試験用のページの調査用の指定: `nohrtfkeeper=1`（HRTF の保持なしで比較）・`traceaudio=1`（ページ内のレンダリングの開始・完了を出す）。
 - 書き出しの監視で打ち切ったときは、ランナーが `WARN` 行を表示する（グループ 72・90 は意図して止める試験なので WARN が出る）。`--log` で書き出しの段階の記録（`TRACE` 行）も表示する。スイートが TIMEOUT になったときは結果なしとして扱い、PASS と数えない。止まったブラウザの終了は試験用のプロファイル（`csx-selftest-`）のプロセスだけにする。
 - UI を変更したら `npm run test:ui`（Phase 08。`scripts/run-ui-test.mjs`: 実際のアプリをヘッドレスの Chrome / Edge で開いて操作する。音声 / 動画の 2 セッション。表示・モードの切替と状態の保持・アップロード・プリセット・CUSTOM・再生・書き出し・プレビュー・ダウンロード・キャンセル・エラー・画面サイズ）を実行する。`--session=audio|video` で一部だけ、`--screens=<フォルダー>` で確認用の画面写真を保存。CPU・切替の時間・メモリは INFO（合否なし）。
-- メモリを測る試験は、他のアプリで空きメモリが少ないと中断（ABORTED）する。実行前に空きメモリを確認する（test:video はブラウザ全体で最大 約 1.4 GB 使う。Phase 07 の測定で Chrome 1341 MB / Edge 1363 MB）。
+- Phase 09 の試験・測定: `npm run test:quality`（4 プリセットの音響品質。ピーク・ラウドネス・相関は判定、True Peak・周波数特性・幅・中央・動き・余韻は INFO）、`npm run test:hrtf`（44.1 ↔ 48 kHz・キャンセルと再実行・文脈の作成と破棄を繰り返し、HRTF の停止を数える）、`npm run measure:memory`（本番ビルドで通常利用のメモリ・CPU を段階ごとに測る。先に `npm run build`。`--endurance` で耐久試験（30 分の再生ほか、約 50 分）、`--quick` は確認用）。合否のない測定は値を記録し、基準を後から結果に合わせない。
+- Motion のワークレットは、停止 → 再生の開始で入力が無音なら STFT の区切りをメディアのサンプル位置にそろえ直す（書き出しと同じ状態から始める）。再生開始の通知（MessagePort）が音より先に届いたときだけ効く。再生の開始を遅らせて通知を先に届ける方法は、曲の終わりの再生と書き出しの差が悪化したため使っていない（docs/SPATIAL.md の Phase 09）。
+- メモリを測る試験は、他のアプリで空きメモリが少ないと中断（ABORTED）する。実行前に空きメモリを確認する（test:video はブラウザ全体で最大 約 1.4 GB 使う。Phase 07 の測定で Chrome 1341 MB / Edge 1363 MB）。空きメモリが 5 GB 未満のときは重い試験を始めない（Phase 08・09 で、他のアプリの使用で空きが 3 GB 台に下がり、Claude Code が試験を止めた・試験が中断した）。試験の実行スクリプトは `CSX_MIN_FREE_MB=3500` で自分で中断させる（空きが 5.2 GB 程度だと、Edge の test:preset の 3 番目のセッション（グループ 43）がこれを下回って中断することがある。そのときは残りのセッションを `--suite=preset&groups=…` で 1 つずつ実行する）。
+- Edge の test:export グループ 68（書き出し 3 回のメモリ）は、Edge 自身の補助プロセス `utility:edge`（約 33 MB）が 1 回目の測定のときだけ止まっていることがあり、その分で基準 30 MB を超えて FAIL することがある（Phase 08 のコードでも再現。アプリのレンダラーは +1〜4 MB。docs/PHASES.md の Phase 09）。結果の行の「調査: 各回の状態」でプロセスごとの内訳を確かめる。基準は変えていない。
 - プリセット・A/B 比較・CUSTOM・解析の最適化を変更したら `npm run test:preset`（Phase 05、13 のブラウザセッションに分けて順に実行）を実行する。INFO 行は合否を判定しない測定値（原因調査など）。
 - 音声処理を変更したら `npm run test:dsp`（ヘッドレス Chrome/Edge で DSP 自己診断）を実行する。既知の FAIL（EDM相当の低域絶対値、docs/PHASES.md 参照）以外が出ないことを確認する。検証項目は `src/dev/dspSelfTest.ts` に追加し、純音だけでなく楽曲相当信号（`src/dev/testSignals.ts`）でも確認する。合格基準を結果に合わせて緩めない。
 - 実装できていない機能は報告で「未実装」と明示する。動作確認していないことを「動作する」と書かない。

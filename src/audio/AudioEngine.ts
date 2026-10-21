@@ -1,5 +1,6 @@
 import type { DspMeters, DspStatus, PlaybackStatus } from '../types/audio'
-import { analyzeSource, bassThresholdFor, buildAnalysisExcerpt, planProcessing, type ProcessingPlan, type SourceAnalysis } from './analysis'
+import { bassThresholdFor, buildAnalysisExcerpt, type ProcessingPlan, type SourceAnalysis } from './analysis'
+import { AnalysisHost } from './analysisFrame/analysisHost'
 import { loadAlignWorklet } from './alignDelay'
 import { analysisStats } from './analysisStats'
 import { DEFAULT_BASS_PARAMS, type BassParams } from './bassSpec'
@@ -9,7 +10,7 @@ import { PlanCache } from './planCache'
 import { eqCapScale } from './biquadMath'
 import type { DynamicsSettings } from './dynamicsTypes'
 import { linearToDb } from './loudness'
-import { analyzeSpatialSource, buildSpatialExcerpt, planSpatial, wideCapFor, type SpatialPlan, type SpatialPlanOptions } from './spatial/spatialAnalysis'
+import { buildSpatialExcerpt, wideCapFor, type SpatialPlan, type SpatialPlanOptions } from './spatial/spatialAnalysis'
 import type { Envelope } from './spatial/motion'
 import { computeEnvelope } from './spatial/motionEnvelope'
 import { transportTime, type MotionReport, type MotionTransport } from './spatial/motionTypes'
@@ -165,6 +166,11 @@ export class AudioEngine {
   private dspListener: ((status: DspStatus) => void) | null = null
   private meters: DspMeters = { bassGrDb: 0, limiterGrDb: 0, spatialLimiterGrDb: 0 }
   private excerpt: AudioBuffer | null = null
+  /**
+   * 処理計画の解析は使い捨ての iframe で行う（Phase 09）。Chrome は AudioWorklet を読み込んだ OfflineAudioContext を解放しないため、
+   * ページ内で解析すると設定を変えるたびにメモリが残っていた。しばらく使わないとフレームごと削除する（analysisHost.ts）
+   */
+  private readonly analysis = new AnalysisHost()
   private sourceAnalysis: SourceAnalysis | null = null
   /** 直近の計画で決まった安全倍率（新しい計画が出るまで維持する） */
   private safetyScale = 1
@@ -472,7 +478,11 @@ export class AudioEngine {
   /** 書き出し中など: 新しい解析を止める / 再開する（再開時に止めていた要求を行う） */
   holdAnalysis(hold: boolean): void {
     this.analysisHeld = hold
-    if (hold) return
+    if (hold) {
+      // 書き出しのメモリに解析の文脈を重ねない（書き出しの前に計画はできているので、使っていなければ今すぐ削除）
+      this.analysis.releaseIfIdle()
+      return
+    }
     const { bass, spatial } = this.heldRequests
     this.heldRequests = { bass: false, spatial: false }
     if (bass) this.requestPlan()
@@ -681,6 +691,7 @@ export class AudioEngine {
     if (this.planTimer) clearTimeout(this.planTimer)
     if (this.spatialPlanTimer) clearTimeout(this.spatialPlanTimer)
     this.analysisToken++
+    this.analysis.dispose()
     this.statusListener = null
     this.dspListener = null
     this.graph?.onMeter(null)
@@ -698,6 +709,8 @@ export class AudioEngine {
 
   private async startAnalysis(buffer: AudioBuffer): Promise<void> {
     const token = ++this.analysisToken
+    // 前の音源の抜粋・文脈を持つフレームを捨てる
+    this.analysis.release()
     this.excerpt = null
     this.sourceAnalysis = null
     this.bassPlans.clear()
@@ -711,7 +724,7 @@ export class AudioEngine {
     try {
       await this.ensureReady()
       const excerpt = buildAnalysisExcerpt(buffer)
-      const source = await analyzeSource(excerpt)
+      const source = await this.analysis.analyzeSource(excerpt)
       if (token !== this.analysisToken) return
       this.excerpt = excerpt
       this.sourceAnalysis = source
@@ -774,7 +787,7 @@ export class AudioEngine {
         this.updateDsp({ analysis: 'measuring' })
         let plan
         try {
-          plan = await planProcessing(excerpt, source, params, {
+          plan = await this.analysis.planProcessing(excerpt, source, params, {
             useWorklet: this.useWorklet,
             makeupCancel: this.makeupCancel,
           })
@@ -824,7 +837,7 @@ export class AudioEngine {
     try {
       await this.ensureReady()
       const excerpt = buildSpatialExcerpt(buffer)
-      const before = await analyzeSpatialSource(excerpt)
+      const before = await this.analysis.analyzeSpatialSource(excerpt)
       if (token !== this.analysisToken) return
       this.spatialExcerpt = excerpt
       this.spatialBefore = before
@@ -909,7 +922,7 @@ export class AudioEngine {
         this.updateSpatial({ analysis: 'measuring' })
         let plan
         try {
-          plan = await planSpatial(excerpt, before, params, {
+          plan = await this.analysis.planSpatial(excerpt, before, params, {
             useWorklet: this.useWorklet,
             hrtfLatencySeconds: this.hrtfLatency,
             envelope: this.envelope,

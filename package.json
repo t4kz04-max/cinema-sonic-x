@@ -15,7 +15,10 @@
     "test:export": "node scripts/run-dsp-selftest.mjs --export",
     "test:video": "node scripts/run-dsp-selftest.mjs --video",
     "test:video:diagnostic": "node scripts/run-dsp-selftest.mjs --video-diagnostic",
-    "test:ui": "node scripts/run-ui-test.mjs"
+    "test:ui": "node scripts/run-ui-test.mjs",
+    "measure:memory": "node scripts/run-memory-profile.mjs",
+    "test:quality": "node scripts/run-dsp-selftest.mjs --suite=quality",
+    "test:hrtf": "node scripts/run-dsp-selftest.mjs --suite=hrtfstress"
   },
   "dependencies": {
     "mediabunny": "1.61.3",

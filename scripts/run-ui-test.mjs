@@ -412,6 +412,53 @@ async function audioSession() {
     check(7, 'カードに専門用語なしの説明と選択中の表示', /選択中/.test(cardText) && !/HRTF|STFT|IR|LUFS/.test(cardText), cardText.replace(/\n/g, ' / '))
     await b.waitFor(`!u.byText('.output-stage__note', '測定中')`, 30000)
 
+    // ---- 9（Phase 09）. アクセシビリティ・キーボード操作 ----
+    const names = await b.ev(`(() => {
+      const els = u.$$('button, [role=button], [role=radio], input, select, a[href]').filter((e) => u.visible(e) && e.type !== 'file')
+      const nameOf = (e) => (e.getAttribute('aria-label') || (e.labels && [...e.labels].map((l) => l.textContent).join(' ')) || e.textContent || e.title || '').trim()
+      const missing = els.filter((e) => !nameOf(e)).map((e) => e.outerHTML.slice(0, 80))
+      return { total: els.length, missing }
+    })()`)
+    check(9, 'アクセシビリティ: ボタン・スライダー・リンクに名前がある（SIMPLE）', names.missing.length === 0, `${names.total} 個中 名前なし ${names.missing.length}${names.missing.length ? `: ${names.missing.slice(0, 3).join(' | ')}` : ''}`)
+    const radios = await b.ev(`u.$$('[role=radiogroup]').filter(u.visible).map((g) => ({ label: g.getAttribute('aria-label'), checked: g.querySelectorAll('[role=radio][aria-checked=true]').length, n: g.querySelectorAll('[role=radio]').length }))`)
+    check(9, 'アクセシビリティ: 選択肢のグループに名前があり、選択中が 1 つ', radios.every((r) => r.label && r.checked === 1), radios.map((r) => `${r.label}:${r.checked}/${r.n}`).join(', '))
+    // Tab キーで主な操作に届く（モード切替・プリセット・再生・書き出し）
+    await b.ev(`(document.activeElement?.blur(), document.body.focus(), true)`)
+    const reached = new Set()
+    for (let i = 0; i < 60; i++) {
+      await b.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 })
+      await b.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 })
+      const tag = await b.ev(`(() => { const e = document.activeElement; return e?.dataset.mode ? 'mode' : e?.dataset.preset ? 'preset' : e?.closest('.dropzone') || e?.classList.contains('dropzone') ? 'upload' : e?.getAttribute('aria-label') === '再生' ? 'play' : e?.dataset.ui === 'export' ? 'export' : e?.id === 'simple-volume' ? 'volume' : e?.id === 'simple-seek' ? 'seek' : e?.textContent?.includes('PROCESSED') ? 'ab' : '' })()`)
+      if (tag) reached.add(tag)
+    }
+    const need = ['mode', 'upload', 'preset', 'seek', 'play', 'ab', 'volume', 'export']
+    check(9, 'キーボード: Tab で主な操作（モード・アップロード・プリセット・シーク・再生・比較・音量・書き出し）に届く', need.every((t) => reached.has(t)), `届いた: ${[...reached].join(', ')}`)
+    const focusRule = await b.ev(`[...document.styleSheets].flatMap((ss) => { try { return [...ss.cssRules] } catch { return [] } }).map((r) => r.cssText).find((t) => /^:focus-visible/.test(t)) ?? ''`)
+    check(9, 'キーボード: フォーカスの表示（:focus-visible に outline）', /outline/.test(focusRule), focusRule)
+    // アップロード欄で Enter → ファイルの選択を開く（input.click を数える）
+    const opened = await b.ev(`(() => {
+      let n = 0
+      const orig = HTMLInputElement.prototype.click
+      HTMLInputElement.prototype.click = function () { if (this.type === 'file') n++; else orig.call(this) }
+      const z = u.$('.dropzone')
+      z.focus()
+      z.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      z.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }))
+      HTMLInputElement.prototype.click = orig
+      return n
+    })()`)
+    check(9, 'キーボード: アップロード欄で Enter / Space がファイルの選択を開く', opened === 2, `${opened} 回`)
+    // Space で再生 / 一時停止（ボタン以外にフォーカスがあるとき）
+    await b.ev(`(document.activeElement?.blur(), true)`)
+    await b.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space', bubbles: true }))`)
+    await sleep(600)
+    const spacePlay = await b.ev(`!!u.$('.simple-preview [aria-label="一時停止"]')`)
+    await b.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space', bubbles: true }))`)
+    await sleep(400)
+    const spacePause = await b.ev(`!!u.$('.simple-preview [aria-label="再生"]')`)
+    check(9, 'キーボード: Space で再生 / 一時停止', spacePlay && spacePause)
+    await b.ev(`u.$('.simple-preview [aria-label="停止"]').click()`)
+
     // ---- 10. 再生操作 / 9. ORIGINAL / PROCESSED ----
     await b.ev(`u.$('.simple-preview [aria-label="再生"]').click()`)
     await sleep(1500)
@@ -476,6 +523,8 @@ async function audioSession() {
     check(2, 'STUDIO: BASS（ENGINE・NORMAL/EXTREME・BASS BOOST・SUB BASS・出力補正）', s2.engine && s2.bassMode.length === 2 && s2.bass.length === 2 && s2.comp)
     check(2, 'STUDIO: EXPORT（16/24-bit・余韻の終端処理の説明）', s2.depth.length === 2 && s2.tailEnd)
     await b.shot('04-studio')
+    const sNames = await b.ev(`(() => { const els = u.$$('button, [role=button], [role=radio], input, select, a[href]').filter((e) => u.visible(e) && e.type !== 'file'); const nameOf = (e) => (e.getAttribute('aria-label') || (e.labels && [...e.labels].map((l) => l.textContent).join(' ')) || e.textContent || e.title || '').trim(); return { total: els.length, missing: els.filter((e) => !nameOf(e)).map((e) => e.outerHTML.slice(0, 80)) } })()`)
+    check(9, 'アクセシビリティ: ボタン・スライダー・リンクに名前がある（STUDIO）', sNames.missing.length === 0, `${sNames.total} 個中 名前なし ${sNames.missing.length}${sNames.missing.length ? `: ${sNames.missing.slice(0, 3).join(' | ')}` : ''}`)
     // STUDIO で再生中の CPU（参考値）
     await b.ev(`u.$('#studio-transport [aria-label="再生"]').click()`)
     await sleep(800)
@@ -613,7 +662,7 @@ async function audioSession() {
     const rendering = await b.waitFor(`u.$('.export-stages li.is-current')?.dataset.stage === 'rendering'`, 60000, 50)
     await b.ev(`u.$('[data-ui="cancel"]').click()`)
     const cx = await waitExport(b, 30000)
-    const afterCancel = await b.ev(`({ live: u.counters().live.length, btn: u.$('[data-ui="export"]').disabled, frames: document.querySelectorAll('iframe').length, result: !!u.$('[data-ui="result"]') })`)
+    const afterCancel = await b.ev(`({ live: u.counters().live.length, btn: u.$('[data-ui="export"]').disabled, frames: document.querySelectorAll('iframe[data-csx-export]').length, result: !!u.$('[data-ui="result"]') })`)
     check(15, 'キャンセル: レンダリング中に止めて「キャンセルしました」・結果なし・iframe なし', rendering && cx.cancelled && !afterCancel.result && afterCancel.frames === 0 && afterCancel.live === urlsBeforeCancel && !afterCancel.btn, JSON.stringify({ ...afterCancel, seen: cx.seen }))
     // キャンセルの後にもう一度書き出せる
     await startExport(b)

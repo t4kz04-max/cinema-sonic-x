@@ -6,6 +6,7 @@ import { analysisStats } from '../audio/analysisStats'
 import type { DspConfig } from '../audio/dspConfig'
 import { DEFAULT_EXPORT_WATCHDOG, estimateExportBytes, EXPORT_MAX_SECONDS, exportMemoryBudget, RENDER_PROGRESS_MAX_SECONDS, reverbTailSeconds, type ExportProgress, type ExportRequest, type ExportWatchdog } from '../audio/export/exportSpec'
 import { ExportCancelledError, exportFrameCount, ExportTimeoutError, pendingRetainedBytes, recentExportTraces, RETAINED_RELEASE_IDLE_MS, retainedReleaseWaitMs, startExport } from '../audio/export/exportRunner'
+import { analysisFrameCount } from '../audio/analysisFrame/analysisHost'
 import { renderExportFloat } from '../audio/export/renderExport'
 import { encodeWav, wavHeader, wavSizeError } from '../audio/export/wavEncoder'
 import { integratedLoudness, linearToDb, samplePeak } from '../audio/loudness'
@@ -190,6 +191,39 @@ function lagOf(a: Float32Array[], b: Float32Array[], from: number, len: number, 
 }
 
 /** テストを実行しているブラウザの物理メモリ（MB）。1 秒待って GC → 3 回の中央値。測れない環境では null */
+/** 調査用: ページ（このウィンドウ）で作られた AudioWorkletNode を数える（書き出しフレームの中のノードは数えない） */
+function countPageWorkletNodes(): { created(): number; restore(): void } {
+  const Orig = window.AudioWorkletNode
+  let n = 0
+  window.AudioWorkletNode = class extends Orig {
+    constructor(...args: ConstructorParameters<typeof AudioWorkletNode>) {
+      super(...args)
+      n++
+    }
+  }
+  return { created: () => n, restore: () => void (window.AudioWorkletNode = Orig) }
+}
+
+/** 調査用: プロセスの種類ごとのワーキングセット / private（MB）。ランナーの csxMemDetail がないときは「測定不可」 */
+async function memDetailText(): Promise<string> {
+  const w = window as unknown as { csxMemDetail?: (id: string) => void; __csxMem?: Record<string, unknown> }
+  if (!w.csxMemDetail) return '内訳 測定不可'
+  const id = String(Math.random())
+  w.csxMemDetail(id)
+  for (let i = 0; i < 100; i++) {
+    await sleep(100)
+    if (w.__csxMem && id in w.__csxMem) {
+      const d = w.__csxMem[id] as Record<string, { ws: number; priv: number }> | null
+      if (!d) return '内訳 測定不可'
+      return Object.entries(d)
+        .sort((a, b) => b[1].ws - a[1].ws)
+        .map(([k, e]) => `${k.replace(/.mojom.w+/, '')} ${e.ws}/${e.priv}`)
+        .join('、')
+    }
+  }
+  return '内訳 測定不可'
+}
+
 async function settledMemoryMb(): Promise<number | null> {
   const w = window as unknown as { csxMemSample?: (id: string) => void; __csxMem?: Record<string, number | null> }
   if (!w.csxMemSample) return null
@@ -636,13 +670,21 @@ export async function runExportSelfTest(): Promise<TestResult[]> {
   group = '68. メモリ（書き出しを繰り返しても増え続けない。使い捨てフレームの効果）'
   if (want(68)) {
     const buf = toBuffer([noise(60, 7, 0.12), noise(60, 8, 0.12)])
+    // 調査用（合否なし）: ページで作った AudioWorkletNode の数・フレームの数・書き出しの完了から測定までの時間・プロセスごとの内訳
+    const nodes = countPageWorkletNodes()
+    const diag: string[] = []
     const mem: (number | null)[] = [await settledMemoryMb()]
+    diag.push(`開始 ${await memDetailText()}`)
     for (let k = 0; k < 3; k++) {
       const r = await startExport(plainRequest(buf, dspOf(3)), () => {}).promise
+      const done = performance.now()
       const url = URL.createObjectURL(r.blob)
       URL.revokeObjectURL(url)
       mem.push(await settledMemoryMb())
+      diag.push(`${k + 1} 回目: 完了→測定 ${((performance.now() - done) / 1000).toFixed(1)} 秒、書き出しフレーム ${exportFrameCount()}、解析フレーム ${analysisFrameCount()}、ページの AudioWorkletNode ${nodes.created()} 個、${await memDetailText()}`)
     }
+    nodes.restore()
+    for (const d of diag) info('調査: 各回の状態（合否なし）', d)
     if (mem.some((m) => m === null)) check('60 秒の書き出し 3 回: 2〜3 回目の増加 ≤ 30 MB', false, '未実行: ブラウザのメモリを測れない環境（npm run test:export で実行してください）')
     else {
       const m = mem as number[]

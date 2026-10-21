@@ -2189,3 +2189,4 @@
 .simple-upload .panel::before,
 .simple-upload .panel::after { display: none; }
 .simple-upload .panel__body { padding: 0; }
+.simple-note--warn { color: var(--warn); }

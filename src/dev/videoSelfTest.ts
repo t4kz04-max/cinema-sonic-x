@@ -531,6 +531,55 @@ export async function runVideoSelfTest(): Promise<TestResult[]> {
     }
   }
 
+  group = '91. サンプルレート・フレームレート・解像度の違い（Phase 09）'
+  if (want(91)) {
+    const variants: { label: string; o: FixtureOptions; name: string }[] = [
+      { label: 'MP4 1280×720・24 fps・AAC 44.1 kHz', o: { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', seconds: 4, width: 1280, height: 720, fps: 24, sampleRate: 44100, marks: [1, 2, 3] }, name: 'v720p24.mp4' },
+      { label: 'MP4 1920×1080・60 fps・AAC 48 kHz', o: { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', seconds: 4, width: 1920, height: 1080, fps: 60, sampleRate: 48000, marks: [1, 2, 3] }, name: 'v1080p60.mp4' },
+      { label: 'WebM 854×480・25 fps・Opus 48 kHz', o: { container: 'webm', videoCodec: 'vp9', audioCodec: 'opus', seconds: 4, width: 854, height: 480, fps: 25, marks: [1, 2, 3] }, name: 'v480p25.webm' },
+      { label: 'MOV 640×360・30 fps・AAC 44.1 kHz', o: { container: 'mov', videoCodec: 'avc', audioCodec: 'aac', seconds: 4, width: 640, height: 360, fps: 30, sampleRate: 44100, marks: [1, 2, 3] }, name: 'v360p30.mov' },
+    ]
+    for (const v of variants) {
+      let made: { file: File; marks: number[] }
+      try {
+        made = await fixtureFile(v.o, v.name)
+      } catch (e) {
+        info(`${v.label}: 試験用の動画を作れない（この環境のエンコーダー）`, e instanceof Error ? e.message : String(e))
+        continue
+      }
+      const r = await load(made.file)
+      if (!r.ok) {
+        check(`${v.label}: 読み込める`, false, `${r.error.message} ${r.error.detail ?? ''}`)
+        continue
+      }
+      const vi = r.audio.video!.info
+      const t = vi.audioTracks.find((a) => a.id === vi.primaryAudioId)!
+      check(
+        `${v.label}: 解像度・フレームレート・サンプルレートを判定`,
+        vi.video.width === v.o.width && vi.video.height === v.o.height && Math.abs((vi.video.fps ?? 0) - (v.o.fps ?? 30)) < 0.5 && t.sampleRate === (v.o.sampleRate ?? 48000) && r.audio.buffer.sampleRate === t.sampleRate,
+        `${vi.video.width}×${vi.video.height}・${f2(vi.video.fps ?? NaN)} fps・音声 ${t.codec} ${t.sampleRate} Hz（デコード後 ${r.audio.buffer.sampleRate} Hz）`,
+      )
+      let res: VideoExportResult
+      try {
+        res = await (await exportVideo(r.audio, dspOf(1), 'trim')).job.promise
+      } catch (e) {
+        check(`${v.label}: 書き出せる`, false, e instanceof Error ? e.message : String(e))
+        continue
+      }
+      const inp = await measureMarks(made.file)
+      const out = await measureMarks(res.blob)
+      const errs = syncErrors(inp, out)
+      check(
+        `${v.label}: 映像のパケット数が同じ・同期の誤差 ≤ ±1 ms（3 か所）`,
+        inp.videoPackets.length === out.videoPackets.length && errs.length === 3 && errs.every((e) => Math.abs(e) <= 0.001),
+        `パケット ${out.videoPackets.length} / ${inp.videoPackets.length}、誤差 ${errs.map(ms).join(' / ')}、${(res.blob.size / 1024).toFixed(0)} KB`,
+      )
+      const back = await load(new File([res.blob], `out-${v.name}`))
+      const bt = back.ok ? back.audio.video!.info.audioTracks.find((a) => a.id === back.audio.video!.info.primaryAudioId) : null
+      check(`${v.label}: 出力の音声のサンプルレート = 入力`, !!bt && bt.sampleRate === t.sampleRate, bt ? `${bt.codec} ${bt.sampleRate} Hz` : back.ok ? '音声トラックなし' : back.error.message)
+    }
+  }
+
   group = '98. 診断（メモリの内訳。合否なし・通常の test:video に含めない）'
   if (wantDiagnostic(98)) {
     const q = new URLSearchParams(location.search)

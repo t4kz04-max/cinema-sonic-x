@@ -4,7 +4,8 @@ import { getPreset, SPATIAL_PRESETS, type PresetId } from '../audio/presets/spat
 import type { AudioPlayer } from '../hooks/useAudioPlayer'
 import { formatBytes, formatChannels, formatHz, formatTime } from '../utils/format'
 import { platformLimits } from '../utils/platform'
-import { MIME_OF } from '../video/videoSpec'
+import { estimateExportBytes, exportMemoryBudget } from '../audio/export/exportSpec'
+import { estimateVideoExportBytes, MIME_OF } from '../video/videoSpec'
 import { ExportError, StageTrack } from './exportCommon'
 import { settingsLabel, STAGE_HINT, type UiStage } from './exportLabels'
 import { PauseIcon, PlayIcon, StopIcon } from './Icons'
@@ -199,6 +200,15 @@ function ExportFlow({ player }: { player: AudioPlayer }) {
   const running = ex.state === 'running' || vs.state === 'running'
   const blocked = !audio ? 'ファイルを読み込んでください。' : !processing ? 'プリセットを選んでください（STUDIO で手動で決めた設定は STUDIO の EXPORT から書き出せます）。' : output === 'video' && !limits.videoExport.ok ? limits.videoExport.reason : null
 
+  // 必要なメモリの目安（書き出し前の判定と同じ見積もり）。上限の半分を超えるときは、他のアプリ・タブを閉じるよう勧める
+  const budget = exportMemoryBudget((navigator as Navigator & { deviceMemory?: number }).deviceMemory)
+  const need = !audio
+    ? 0
+    : output === 'video' && audio.video
+      ? estimateVideoExportBytes(audio.video.info, { frames: audio.buffer.length, channels: audio.buffer.numberOfChannels, sampleRate: audio.buffer.sampleRate }, player.dspConfig.spatial)
+      : estimateExportBytes(Math.ceil(audio.buffer.duration * (audio.header.sampleRate ?? audio.buffer.sampleRate)), audio.buffer.numberOfChannels, audio.header.sampleRate ?? audio.buffer.sampleRate, player.dspConfig.spatial, opt.bitDepth)
+  const heavy = need > budget * 0.5
+
   const start = () => {
     if (output === 'video') void player.exportSpatialVideo(opt.videoTail, label)
     else void player.exportWav(opt.bitDepth, label)
@@ -251,6 +261,12 @@ function ExportFlow({ player }: { player: AudioPlayer }) {
           )}
         </div>
         {blocked && !running && <p className="simple-note">{blocked}</p>}
+        {audio && !blocked && (
+          <p className={`simple-note${heavy ? ' simple-note--warn' : ''}`} data-ui="memory-estimate">
+            加工に使うメモリの目安: 約 {formatBytes(need)}（上限 {formatBytes(budget)}）。
+            {heavy ? ' 長い・大きいファイルです。他のアプリやブラウザのタブを閉じて、PC の空きメモリに余裕がある状態で加工してください（足りないと途中で失敗します）。' : ''}
+          </p>
+        )}
         {progress && (
           <StageTrack stages={stages} current={progress.stage} fraction={progress.fraction} fractionLabel={progress.stage === 'rendering' ? '加工済み' : progress.stage === 'muxing' ? '書き込み済み' : undefined} />
         )}

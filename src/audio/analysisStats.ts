@@ -13,3 +13,9 @@ export function countAnalysisRender(worklet: boolean): void {
   analysisStats.renders++
   if (worklet) analysisStats.workletRenders++
 }
+
+/** 解析用フレーム（Phase 09）で作った文脈の数を足す（フレームから結果と一緒に届く） */
+export function addAnalysisRenders(renders: number, workletRenders: number): void {
+  analysisStats.renders += renders
+  analysisStats.workletRenders += workletRenders
+}

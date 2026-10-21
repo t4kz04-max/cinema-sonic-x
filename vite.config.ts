@@ -11,6 +11,8 @@ export default defineConfig({
       input: {
         main: resolve(__dirname, 'index.html'),
         exportFrame: resolve(__dirname, 'export-frame.html'),
+        // analysis-frame.html: 解析用のフレーム（Phase 09。しばらく使わないと削除してメモリを返す）
+        analysisFrame: resolve(__dirname, 'analysis-frame.html'),
       },
     },
   },
