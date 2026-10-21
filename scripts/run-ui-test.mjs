@@ -4,6 +4,7 @@
 //         CSX_BROWSER=<実行ファイル> npm run test:ui
 //         node scripts/run-ui-test.mjs --session=audio|video   （一部だけ）
 //         node scripts/run-ui-test.mjs --screens=<フォルダー>   （確認用の画面写真を保存）
+//         node scripts/run-ui-test.mjs --preview   （本番ビルド（dist、先に npm run build）を vite preview で開く。Phase 10: 公開前の確認）
 // 依存追加なし: Vite の開発サーバー + Chrome DevTools Protocol（Node 22+ の組み込み WebSocket）
 // 試験用の音声（WAV）は Node で合成し、試験用の動画は src/dev/videoFixtures.ts（WebCodecs）でブラウザ内で作る。
 // 2 つのセッション（音声 / 動画）を別々のブラウザで順に実行する（メモリを積み上げない）。
@@ -12,7 +13,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { freemem, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createServer } from 'vite'
+import { createServer, preview } from 'vite'
 
 const CANDIDATES = [
   process.env.CSX_BROWSER,
@@ -31,6 +32,7 @@ if (!browser) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const onlySession = process.argv.find((a) => a.startsWith('--session='))?.slice(10)
 const screensDir = process.argv.find((a) => a.startsWith('--screens='))?.slice(10)
+const usePreview = process.argv.includes('--preview')
 const MIN_FREE_MB = Number(process.env.CSX_MIN_FREE_MB ?? 400)
 if (screensDir) mkdirSync(screensDir, { recursive: true })
 
@@ -95,10 +97,35 @@ const FILES = {
 writeFileSync(FILES.text, 'this is not audio')
 writeFileSync(FILES.broken, Buffer.concat([Buffer.from('RIFF\x10\x00\x00\x00WAVEjunk'), Buffer.alloc(4000, 7)]))
 
-// ---------- ページに入れる計測（トップのページだけ。書き出し用の iframe には入れない） ----------
+// ---------- ページに入れる計測（文脈・Object URL はトップのページだけ。AudioWorklet の読み込みは iframe も） ----------
 const INSTRUMENT = `(() => {
+  if (window === window.top) window.__csxUi = { audioCtx: 0, offlineCtx: 0, created: 0, revoked: 0, urls: new Set(), worklets: [] }
+  // Phase 10: AudioWorklet の読み込み（addModule）の成否を、ページ・解析用 iframe・書き出し用 iframe で記録する。
+  // 読み込みに失敗するとアプリは簡易モード（DynamicsCompressor）に切り替えて動き続けるため、ほかの項目では気づけない（本番ビルドの URL の誤りなど）
+  const where = window === window.top ? 'page' : location.pathname.replace(/^.*\\//, '')
+  const log = (x) => {
+    try {
+      window.top.__csxUi.worklets.push(where + ':' + x)
+    } catch {
+      // トップのページの計測がない（試験の外）
+    }
+  }
+  const W = window.AudioWorklet
+  if (W) {
+    const add = W.prototype.addModule
+    W.prototype.addModule = function (url, ...rest) {
+      const name = (String(url).match(/(\\w+)\\.worklet/) || [null, String(url)])[1]
+      return add.call(this, url, ...rest).then(
+        (v) => (log(name + ':ok'), v),
+        (e) => {
+          log(name + ':fail ' + e)
+          throw e
+        },
+      )
+    }
+  }
   if (window !== window.top) return
-  const c = (window.__csxUi = { audioCtx: 0, offlineCtx: 0, created: 0, revoked: 0, urls: new Set() })
+  const c = window.__csxUi
   for (const [name, key] of [['AudioContext', 'audioCtx'], ['OfflineAudioContext', 'offlineCtx']]) {
     const O = window[name]
     if (!O) continue
@@ -165,8 +192,15 @@ const HELPERS = `(() => {
 })()`
 
 // ---------- ブラウザ ----------
-const server = await createServer({ logLevel: 'error', server: { port: 5299, strictPort: false } })
-await server.listen()
+// --preview: アプリは本番ビルド（dist）を開く。試験用の動画は src/dev（本番ビルドに含めない）で作るため、開発サーバーは動画の作成だけに使う
+if (usePreview && !existsSync('dist/index.html')) {
+  console.error('dist がありません。先に npm run build を実行してください。')
+  process.exit(2)
+}
+const devServer = await createServer({ logLevel: 'error', server: { port: 5299, strictPort: false } })
+await devServer.listen()
+const fixtureUrl = devServer.resolvedUrls.local[0]
+const server = usePreview ? await preview({ logLevel: 'error', preview: { port: 4299, strictPort: false } }) : devServer
 const baseUrl = server.resolvedUrls.local[0]
 
 const results = []
@@ -672,10 +706,27 @@ async function audioSession() {
     check(15, 'キャンセルの後にもう一度書き出せる（90 秒 + 余韻、選んだビット深度）', re.done && reWav.seconds >= 90 && reWav.bits === depthNow, re.done ? `${reWav.seconds.toFixed(2)} 秒・${re.ms} ms` : String(re.err))
     info('ブラウザのメモリ（音声のセッションの終わり、MB）', String(b.browserMemoryMb()?.toFixed(0)))
     const errs = b.errors.filter((e) => !/favicon/.test(e))
+    await workletCheck(b)
     check(18, 'ページのエラー（例外・console.error）なし', errs.length === 0, errs.slice(0, 3).join(' | '))
   } finally {
     await b.close()
   }
+}
+
+/** AudioWorklet の読み込み（ページ・解析用 iframe・書き出し用 iframe）に失敗がなく、それぞれで読み込めている（Phase 10） */
+async function workletCheck(b) {
+  const wl = (await b.ev(`window.__csxUi?.worklets ?? []`)) ?? []
+  const fails = wl.filter((x) => x.includes(':fail'))
+  const okIn = (w) => [...new Set(wl.filter((x) => x.startsWith(w + ':') && x.endsWith(':ok')).map((x) => x.split(':')[1]))].sort()
+  const page = okIn('page')
+  const analysis = okIn('analysis-frame.html')
+  const exp = okIn('export-frame.html')
+  check(
+    19,
+    'AudioWorklet の読み込み: 失敗なし・ページ（再生）・解析用 iframe・書き出し用 iframe で読み込める',
+    fails.length === 0 && page.includes('bassDynamics') && analysis.length > 0 && exp.includes('bassDynamics'),
+    `ページ [${page.join(', ')}]、解析用 [${analysis.join(', ')}]、書き出し用 [${exp.join(', ')}]${fails.length ? `、失敗 ${fails.slice(0, 3).join(' | ')}` : ''}`,
+  )
 }
 
 // ================= セッション 2: 動画 =================
@@ -683,8 +734,11 @@ async function videoSession() {
   currentSession = 'video'
   const b = await launch()
   try {
-    await b.navigate()
     // 試験用の動画をブラウザ内で作り（WebCodecs）、ファイルとして保存してから読み込む（実際のファイルの選択と同じ経路）
+    if (usePreview) {
+      await b.send('Page.navigate', { url: fixtureUrl })
+      await b.waitFor(`!!document.querySelector('[data-view]')`, 30000)
+    } else await b.navigate()
     const b64 = await b.ev(`(async () => {
       const { makeFixtureVideo } = await import('/src/dev/videoFixtures.ts')
       const { blob } = await makeFixtureVideo({ container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', seconds: 8, width: 640, height: 360, tone: 0.2 })
@@ -695,6 +749,7 @@ async function videoSession() {
     })()`)
     const videoPath = join(work, 'ui-test-video.mp4')
     writeFileSync(videoPath, Buffer.from(b64, 'base64'))
+    if (usePreview) await b.navigate()
 
     // ---- 6. 動画のアップロード ----
     await b.setFile(videoPath)
@@ -756,6 +811,9 @@ async function videoSession() {
     check(2, 'STUDIO: 動画の書き出し（余韻の終端処理 2 種・元の音声の抽出・同じ完成ファイル）', sv.tail.length === 2 && sv.orig && sv.same && sv.res, JSON.stringify(sv))
     await b.shot('07-studio-video')
 
+    // 次の項目でページを読み込み直す（計測が消える）ため、その前に確かめる
+    await workletCheck(b)
+
     // ---- 17. スマートフォン: 動画の書き出しを制限して理由を表示 ----
     await b.send('Emulation.setUserAgentOverride', { userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36' })
     await b.viewport(390, 844, true)
@@ -777,7 +835,7 @@ async function videoSession() {
   }
 }
 
-console.log(`ブラウザ: ${browser}\n`)
+console.log(`ブラウザ: ${browser}${usePreview ? '（本番ビルド: vite preview）' : ''}\n`)
 let aborted = null
 for (const [name, fn] of [
   ['audio', audioSession],
@@ -793,7 +851,8 @@ for (const [name, fn] of [
     break
   }
 }
-await server.close()
+if (server !== devServer) await server.close()
+await devServer.close()
 try {
   rmSync(work, { recursive: true, force: true })
 } catch {

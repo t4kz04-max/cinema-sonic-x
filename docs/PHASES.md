@@ -16,6 +16,7 @@
 | 07 | Video Processing Engine | 実装済み・安定化済み・Chrome/Edge で検証（test:video 48 PASS / 1 FAIL: 続けて書き出すとメモリが一時的に積み上がる、test:export 68/68。Edge の書き出しの停止は対策後 0 回・原因は未確定、下記）。実際の動画ファイル・試聴は未確認 |
 | 08 | SIMPLE MODE / STUDIO MODE（UI・UX の統合） | 実装済み・Chrome/Edge で検証（test:ui 63/63、既存試験は既知の FAIL のみ・新規 FAIL なし）。実機の目視・実際のスマートフォン・試聴は未確認 |
 | 09 | Final Quality & Release | **開発・自動検証完了、実機受け入れ確認待ち**: メモリの改善（解析を使い捨てのフレームへ。グループ 88 の FAIL が解消）・品質の測定・耐久試験・Chrome / Edge の全スイートは完了。既知の FAIL は記録済み（Edge の test:export グループ 68 は Edge の補助プロセスによる変動。Phase 08 でも再現）。試聴・実際の動画・実機・配布手順は未確認 |
+| 10 | Web 公開準備（Vercel） | 本番ビルドを検証済み: 本番ビルド（vite preview）で test:ui 72 / 72（Chrome / Edge）。vercel.json・COOP / COEP は不要。公開・push・main への統合は未実施 |
 
 最終的な製品フロー: 音声/動画をアップロード → 立体音響プリセットを選択 → 生成 → 完成表示 → 加工済みファイルを再生 → ダウンロード。
 メイン画面（SIMPLE）はシンプルにし、音響の詳細設定は STUDIO（`#studio`）に分離した（Phase 08）。
@@ -489,3 +490,52 @@ source → input ─┬─ dry(1/0) ──────────────�
 4. 配布手順の確認（配布先・手順は未決定）
 5. Edge の HRTF の停止の根本原因（対策後の試験では 0 回。原因は未確定。docs/SPATIAL.md）
 6. Motion を使う設定での再生と書き出しのサンプル単位の差（再生開始の通知が音より先に届いたときだけそろう。docs/SPATIAL.md の Phase 09）
+
+---
+
+## Phase 10 — Web 公開準備（Vercel）
+
+新しい機能は増やさず、本番ビルドを Vercel の静的ホスティングで安全に公開できるかを確認する。**公開・git push・デプロイは行っていない**（利用者の確認待ち）。
+
+**Vercel の設定**: Framework Preset = Vite、Build Command = `npm run build`、Output Directory = `dist`、Install Command = 既定（`npm install`。package-lock.json あり）、環境変数 = なし。`vercel.json` は作らない（下記の理由）
+
+**確認したこと（2026-10-21）**
+- 本番ビルド（`dist`、約 1 MB）: `index.html`・`export-frame.html`・`analysis-frame.html`・`favicon.svg`・`assets/`。ソースマップなし。試験用のページ（tests/dsp-selftest.html）・`src/dev` の診断のコードは含まれない（本番のバンドルに試験用の名前が出てこないことを確認）
+- AudioWorklet: 4 つのワークレットは Vite の `?worker&url` で `/assets/*.worklet-<hash>.js` に出力され、`addModule` は同じオリジンの URL を読む。書き出し用・解析用のフレームは `import.meta.env.BASE_URL` から `/export-frame.html`・`/analysis-frame.html` を開く（同じオリジン）。`vite preview` で全ファイルが 200・正しい Content-Type（text/html・text/javascript・text/css・image/svg+xml）で返ることを確認
+- HRTF: ブラウザに内蔵のデータ（PannerNode の HRTF）を使い、ファイルを読み込まない
+- `vercel.json` が不要な理由: 画面の切替は URL のハッシュ（`#studio`）でサーバーへの経路がない（SPA の書き換えが不要）。HTML はファイル名どおり（`/export-frame.html` など）で配信され、`assets/` はハッシュ付きのファイル名。特別なヘッダーも不要（下記）
+- COOP / COEP（Cross-Origin Isolation）: 不要。アプリは SharedArrayBuffer・Atomics を使わない（本番のバンドルにある SharedArrayBuffer は mediabunny の `typeof SharedArrayBuffer` の型の判定だけ）。iframe・ワークレットはすべて同じオリジン。根拠なくヘッダーは追加していない
+- HTTPS: AudioWorklet・WebCodecs はセキュアコンテキストが必要。Vercel は HTTPS で配信するので条件を満たす（`localhost` もセキュアコンテキスト）。実際の HTTPS の環境での確認は未実施（デプロイしていない）
+
+**セキュリティ・プライバシー**
+- 音声・動画を外部へ送らない根拠: アプリのコード（`src`、`src/dev` を除く）に `fetch`・XMLHttpRequest・WebSocket・sendBeacon・EventSource・外部 URL がない。ファイルは `<input type="file">`・ドロップで受け取り、File / ArrayBuffer としてブラウザ内でデコード・処理し、結果は Blob（Object URL）でダウンロードする。本番のバンドルにある `fetch` は Vite のモジュールの先読み（同じオリジンのスクリプト）だけ。外部の URL は XML の名前空間・エラーメッセージの説明のリンクの文字列だけで、通信はしない
+- 秘密情報: 環境変数（`import.meta.env`）は `BASE_URL` だけ。API キー・トークンはない。`.env` のファイルはない。`.gitignore` に `.env`・`.env.*`・`.vercel` を追加した（以前は `*.local` だけで、`.env` が誤ってコミットされうる状態だった）
+- 開発用の画面: 試験用のページ・診断の機能（`?traceaudio=1` など）は本番のビルドに含まれず、利用者には見えない
+- Vercel 側: Vercel Analytics・Speed Insights などは追加していない（外部への通信を増やさないため。追加するときは利用者の判断）
+
+**変更**
+- `.gitignore`: `.env`・`.env.*`・`.vercel`
+- `scripts/run-ui-test.mjs`: `--preview`（本番ビルドを `vite preview` で開いて test:ui を実行。試験用の動画は src/dev で作るため、開発サーバーは動画の作成だけに使う）
+- `scripts/run-ui-test.mjs`: 項目 19「AudioWorklet の読み込み」を追加（70 → 72 項目。音声・動画の各セッションで 1 つ）。ページ・解析用 iframe・書き出し用 iframe の `addModule` の成否を記録し、失敗がなく、それぞれで読み込めていることを確かめる。アプリは読み込みに失敗すると簡易モード（DynamicsCompressor）に切り替えて動き続けるため、これまでの 70 項目では本番ビルドのワークレットの URL の誤りに気づけなかった。既存の項目の基準は変えていない
+
+**本番ビルドの試験（2026-10-21、`npm run build` → `node scripts/run-ui-test.mjs --preview`、1 つずつ実行、空きメモリ 5.0 GB 以上で開始）**
+
+| | Chrome 155 | Edge 155 |
+| --- | --- | --- |
+| test:ui --preview（項目 19 を追加する前の 70 項目） | 70 / 70 PASS | 70 / 70 PASS |
+| test:ui --preview（72 項目） | 72 / 72 PASS | 72 / 72 PASS |
+| test:ui（開発サーバー、72 項目。項目 19 の追加の確認） | 72 / 72 PASS | — |
+
+- 確かめた操作: 起動・SIMPLE / STUDIO の切替と状態の保持・音声の読み込み（48 / 44.1 kHz）・4 プリセット・再生 / 一時停止 / 停止・ORIGINAL / PROCESSED・WAV の書き出し（段階の表示・ヘッダー・ファイル名・ダウンロード・キャンセルと再実行）・動画の読み込み（MP4）・動画の書き出し（MUXING まで・MP4・ダウンロード）・動画から音声だけ・完成ファイルのプレビュー・Object URL の解放・スマートフォンの制限・画面幅・キーボード / アクセシビリティ・ページのエラー（例外・console.error）なし
+- AudioWorklet（項目 19）: ページ（再生）は align・bassDynamics・motion・tail、解析用 iframe は bassDynamics・motion・tail、書き出し用 iframe は align・bassDynamics・motion・tail を読み込み、失敗 0（Chrome / Edge）
+- 書き出しの時間（試験の音源）: WAV 12 秒 + 余韻 6.5〜7.7 秒、動画 8 秒 4.6〜4.9 秒
+- 1 回目の 72 項目の Chrome の実行で、動画のセッションの項目 19 が FAIL した（ページ [bassDynamics] だけ）。原因は試験の順序: 直前の項目 17（スマートフォン）でページを読み込み直し、記録が消えていた。項目 19 を項目 17 の前に移した（判定の基準は同じ）。アプリの問題ではない
+
+**公開前の確認**
+- GitHub: リモートは未設定。公開用のブランチは `main` を候補とする。`main`（ec5c1f3、Phase 00〜02.5）は `feature/spatial-audio` の祖先で、9 コミット分を早送りで統合できる（未実施）
+- 履歴: 秘密情報（API キーなど）・大きなファイル（最大は docs/SPATIAL.md の 約 100 KB）なし。コミットの作成者のメールアドレスが履歴に含まれる（公開リポジトリにすると見える）
+- 公開されるファイル: Vercel が配信するのは `dist` だけ（試験用のページ・`src/dev`・`scripts`・`docs` は配信されない）。リポジトリを公開にした場合は、`docs`・`CLAUDE.md`・試験のコードも公開される
+
+**未確認**
+- Vercel 上（HTTPS・CDN）での動作: デプロイしていないため未確認
+- GitHub: リモートが設定されていない（`git remote -v` が空）
