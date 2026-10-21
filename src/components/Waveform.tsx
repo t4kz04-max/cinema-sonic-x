@@ -12,6 +12,21 @@ const PEAK_BUCKETS = 2000
 const BAR_WIDTH = 2
 const BAR_GAP = 1
 
+/**
+ * 音源ごとのピーク（画面のモードの切替で波形を作り直しても、長い音源の全サンプルを読み直さない）。
+ * WeakMap なので音源を読み替えると古いピークも解放される
+ */
+const peakCache = new WeakMap<AudioBuffer, Float32Array>()
+
+function peaksOf(buffer: AudioBuffer): Float32Array {
+  let p = peakCache.get(buffer)
+  if (!p) {
+    p = computePeaks(buffer)
+    peakCache.set(buffer, p)
+  }
+  return p
+}
+
 /** 全チャンネルを通した区間ごとの最小・最大値（実データそのまま。正規化しない） */
 function computePeaks(buffer: AudioBuffer): Float32Array {
   const peaks = new Float32Array(PEAK_BUCKETS * 2)
@@ -39,7 +54,7 @@ export function Waveform({ buffer, progress, onSeekRatio }: WaveformProps) {
   const [wrapRef, size] = useElementSize<HTMLDivElement>()
   const canvasRef = useRef<HTMLCanvasElement>(null)
 
-  const peaks = useMemo(() => (buffer ? computePeaks(buffer) : null), [buffer])
+  const peaks = useMemo(() => (buffer ? peaksOf(buffer) : null), [buffer])
 
   useEffect(() => {
     const canvas = canvasRef.current

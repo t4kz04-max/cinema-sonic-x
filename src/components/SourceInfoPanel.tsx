@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import type { LoadedAudio } from '../types/audio'
 import { estimateDecodedBytes } from '../utils/fileValidation'
 import { formatBytes, formatChannels, formatHz, formatTime } from '../utils/format'
@@ -16,8 +17,16 @@ interface Row {
 function buildRows(audio: LoadedAudio): Row[] {
   const { buffer, header } = audio
   const resampled = header.sampleRate !== null && header.sampleRate !== buffer.sampleRate
+  const v = audio.video?.info
   const rows: Row[] = [
-    { label: '長さ', value: formatTime(buffer.duration, true) },
+    { label: '種類', value: v ? `動画（${v.container.toUpperCase()}）` : '音声' },
+    ...(v
+      ? [
+          { label: '映像', value: `${v.video.width}×${v.video.height}${v.video.fps ? ` / ${v.video.fps.toFixed(2)} fps` : ''}`, note: `${v.video.codec}（書き出しでは再エンコードせずにコピー）` },
+          { label: '動画の長さ', value: formatTime(v.duration, true) },
+        ]
+      : []),
+    { label: v ? '音声の長さ' : '長さ', value: formatTime(buffer.duration, true) },
     {
       label: 'サンプルレート（元）',
       value: header.sampleRate !== null ? formatHz(header.sampleRate) : '取得できませんでした',
@@ -42,7 +51,7 @@ function buildRows(audio: LoadedAudio): Row[] {
   return rows
 }
 
-export function SourceInfoPanel({ audio }: SourceInfoPanelProps) {
+export const SourceInfoPanel = memo(function SourceInfoPanel({ audio }: SourceInfoPanelProps) {
   return (
     <Panel
       index="02"
@@ -73,4 +82,4 @@ export function SourceInfoPanel({ audio }: SourceInfoPanelProps) {
       )}
     </Panel>
   )
-}
+})

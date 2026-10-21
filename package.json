@@ -14,7 +14,8 @@
     "test:preset": "node scripts/run-dsp-selftest.mjs --preset",
     "test:export": "node scripts/run-dsp-selftest.mjs --export",
     "test:video": "node scripts/run-dsp-selftest.mjs --video",
-    "test:video:diagnostic": "node scripts/run-dsp-selftest.mjs --video-diagnostic"
+    "test:video:diagnostic": "node scripts/run-dsp-selftest.mjs --video-diagnostic",
+    "test:ui": "node scripts/run-ui-test.mjs"
   },
   "dependencies": {
     "mediabunny": "1.61.3",

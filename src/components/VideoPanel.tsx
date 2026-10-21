@@ -1,32 +1,26 @@
-import { useState } from 'react'
+import { memo } from 'react'
 import type { WavBitDepth } from '../audio/export/wavEncoder'
-import { getPreset } from '../audio/presets/spatialPresets'
 import type { AudioPlayer } from '../hooks/useAudioPlayer'
+import { platformLimits } from '../utils/platform'
 import { formatBytes, formatHz, formatTime } from '../utils/format'
 import { estimateVideoOutputBytes, MIME_OF, outputAudioCodecFor, VIDEO_AUDIO_BITRATE, type VideoTailMode } from '../video/videoSpec'
+import { ExportError, StageTrack } from './exportCommon'
+import { settingsLabel, STAGE_LABEL } from './exportLabels'
+import { MediaCompare } from './MediaCompare'
 import { Badge, Panel } from './Panel'
 
 interface VideoPanelProps {
   player: AudioPlayer
 }
 
-const STAGE_LABEL = { preparing: 'PREPARING', rendering: 'RENDERING', encoding: 'ENCODING', muxing: 'MUXING' } as const
-
-function settingsLabel(player: AudioPlayer): string {
-  const ps = player.presetState
-  if (ps.activeId) return getPreset(ps.activeId).label
-  if (ps.savedActive) return 'CUSTOM（保存）'
-  if (ps.custom) return 'CUSTOM'
-  return player.spatialParams.mode === 'off' ? 'ORIGINAL 相当（空間 OFF）' : '手動設定'
-}
-
 /** 動画の入力・書き出し（Phase 07）。音声だけの WAV（元の音声 / 立体音響化）と、音声を差し替えた動画 */
-export function VideoPanel({ player }: VideoPanelProps) {
+export const VideoPanel = memo(function VideoPanel({ player }: VideoPanelProps) {
   const { audio, videoState: vs, originalUrl } = player
-  const [tailMode, setTailMode] = useState<VideoTailMode>('trim')
-  const [bitDepth, setBitDepth] = useState<WavBitDepth>(16)
-  // プレビューを再生できなかった結果の URL（コーデックをブラウザ・OS が再生できない場合など）
-  const [unplayableUrl, setUnplayableUrl] = useState<string | null>(null)
+  // 設定は SIMPLE MODE と共有する（画面のモードを切り替えても保つ）
+  const { bitDepth, videoTail: tailMode } = player.exportOptions
+  const setBitDepth = (d: WavBitDepth) => player.setExportOptions({ bitDepth: d })
+  const setTailMode = (m: VideoTailMode) => player.setExportOptions({ videoTail: m })
+  const limits = platformLimits()
   const video = audio?.video
   if (!audio || !video) return null
   const info = video.info
@@ -52,7 +46,7 @@ export function VideoPanel({ player }: VideoPanelProps) {
     )
 
   return (
-    <Panel index="09" label="VIDEO" title="動画（音声の抽出・立体音響化・差し替え）" className="panel--video" aside={badge}>
+    <Panel index="11" label="VIDEO" id="studio-video" title="動画（音声の抽出・立体音響化・差し替え）" className="panel--video" aside={badge}>
       <dl className="spec-list spec-list--compact">
         <div className="spec-list__row">
           <dt>ファイル</dt>
@@ -138,47 +132,33 @@ export function VideoPanel({ player }: VideoPanelProps) {
               ? '映像の終わりで音声を切り、最後の 20 ms をフェード（映像の長さは変えない。映像の後ろの余韻は入らない）'
               : '最後のフレームの表示時間を延ばし、余韻が消えるまで映像を出す（再エンコードなし。映像の長さが余韻の分だけ長くなる）'}
           </p>
-          <button type="button" className="btn-export" disabled={running} onClick={() => void player.exportSpatialVideo(tailMode, label)}>
+          {!limits.videoExport.ok && <p className="notice">{limits.videoExport.reason}</p>}
+          <button type="button" className="btn-export" disabled={running || !limits.videoExport.ok} onClick={() => void player.exportSpatialVideo(tailMode, label)}>
             {vs.state === 'running' && vs.kind === 'video' ? '書き出し中…' : '動画を書き出す'}
           </button>
         </div>
       </div>
 
       {vs.state === 'running' && (
-        <div className="export-progress" role="status">
-          <div className="export-stages">
-            {(['preparing', 'rendering', 'encoding', 'muxing'] as const).map((s) => (
-              <span key={s} className={vs.progress.stage === s ? 'is-current' : ''}>
-                {STAGE_LABEL[s]}
-              </span>
-            ))}
-          </div>
-          {vs.progress.fraction !== undefined && (
-            <>
-              <div className="export-bar">
-                <span style={{ width: `${(vs.progress.fraction * 100).toFixed(1)}%` }} />
-              </div>
-              <p className="output-stage__note mono">
-                {vs.progress.stage === 'rendering' ? 'レンダリング済み' : '書き込み済み（映像の時刻）'} {(vs.progress.fraction * 100).toFixed(0)}%
-              </p>
-            </>
-          )}
+        <>
+          <StageTrack
+            stages={vs.kind === 'video' ? ['preparing', 'rendering', 'encoding', 'muxing'] : ['encoding']}
+            current={vs.progress.stage}
+            fraction={vs.progress.fraction}
+            fractionLabel={vs.progress.stage === 'rendering' ? 'レンダリング済み' : '書き込み済み（映像の時刻）'}
+          />
           {vs.kind === 'video' && (
             <button type="button" className="btn-chip" onClick={player.cancelVideo}>
               キャンセル
             </button>
           )}
-        </div>
+        </>
       )}
-      {vs.state === 'error' && (
-        <p className="notice">
-          {vs.message}
-          {vs.detail && <small> {vs.detail}</small>}
-        </p>
-      )}
+      {vs.state === 'error' && <ExportError message={vs.message} detail={vs.detail} />}
       {vs.state === 'cancelled' && <p className="output-stage__note">キャンセルしました（ファイルは作成していません）。</p>}
       {vs.state === 'complete' && (
         <div className="export-done">
+          <StageTrack stages={vs.kind === 'video' ? ['preparing', 'rendering', 'encoding', 'muxing'] : ['encoding']} current="complete" />
           <p className="export-done__title">PROCESSING COMPLETE</p>
           {vs.kind === 'video' ? (
             <dl className="spec-list spec-list--compact">
@@ -227,18 +207,17 @@ export function VideoPanel({ player }: VideoPanelProps) {
           <a className="btn-export btn-export--download" href={vs.url} download={vs.fileName}>
             {vs.kind === 'video' ? '動画をダウンロード' : 'WAV をダウンロード'}
           </a>
-          {vs.kind === 'video' ? (
-            <video className="video-preview" controls preload="metadata" src={vs.url} onPlay={player.pause} onError={() => setUnplayableUrl(vs.url)} data-preview="output" />
-          ) : (
-            <audio controls preload="metadata" src={vs.url} onPlay={player.pause} onError={() => setUnplayableUrl(vs.url)} data-preview="original-wav" />
-          )}
-          {unplayableUrl === vs.url ? (
-            <p className="output-stage__note">このブラウザは書き出したファイルのコーデックを再生できないため、プレビューできません。ファイルはダウンロードして対応するプレイヤーで再生してください。</p>
-          ) : (
-            <p className="output-stage__note">書き出したファイルそのものを再生します（再生用の空間処理は通しません）。</p>
-          )}
+          <MediaCompare
+            kind={vs.kind === 'video' ? 'video' : 'audio'}
+            exportedUrl={vs.url}
+            originalUrl={canPlayInput ? originalUrl : null}
+            enginePlaying={player.status === 'playing'}
+            onPlay={player.pause}
+            volume={player.volume}
+            note={vs.kind === 'video' ? '書き出した動画そのものを再生します（再生用の空間処理は通しません）。ORIGINAL は読み込んだ元の動画です。' : '書き出した WAV（処理なし）をそのまま再生します。'}
+          />
         </div>
       )}
     </Panel>
   )
-}
+})

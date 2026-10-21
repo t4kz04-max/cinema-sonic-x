@@ -7,12 +7,14 @@ interface PanelProps {
   title: string
   aside?: ReactNode
   className?: string
+  /** STUDIO MODE のセクションへのリンク先 */
+  id?: string
   children: ReactNode
 }
 
-export function Panel({ index, label, title, aside, className, children }: PanelProps) {
+export function Panel({ index, label, title, aside, className, id, children }: PanelProps) {
   return (
-    <section className={`panel ${className ?? ''}`} aria-label={title}>
+    <section className={`panel ${className ?? ''}`} aria-label={title} id={id}>
       <header className="panel__head">
         <div className="panel__heading">
           <span className="panel__index">{index}</span>

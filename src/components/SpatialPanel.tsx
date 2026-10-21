@@ -1,8 +1,11 @@
+import { memo } from 'react'
 import { motionPeriodSeconds, type MotionPreset } from '../audio/spatial/motion'
 import {
   cinemaSettings,
   hallSettings,
   isMotionActive,
+  isTailActive,
+  TAIL_MODE_DOCS,
   MODE_DOCS,
   MOTION_CAVEATS,
   MOTION_PARAM_DOCS,
@@ -245,7 +248,7 @@ function MetricsTable({ before, after, status }: { before: StereoMetrics | null;
   )
 }
 
-export function SpatialPanel({ player }: SpatialPanelProps) {
+export const SpatialPanel = memo(function SpatialPanel({ player }: SpatialPanelProps) {
   const { spatialParams: p, dsp, bypass, status: playStatus } = player
   const s = dsp?.spatial ?? null
   const mode = p.mode
@@ -257,6 +260,7 @@ export function SpatialPanel({ player }: SpatialPanelProps) {
   return (
     <Panel
       index="05"
+      id="studio-spatial"
       label="SPATIAL"
       title="空間音響の詳細設定"
       className="panel--spatial"
@@ -320,10 +324,6 @@ export function SpatialPanel({ player }: SpatialPanelProps) {
         </div>
       </div>
 
-      <MotionBlock player={player} />
-
-      <TailBlock player={player} />
-
       {doc && (
         <div className="spatial-doc">
           <div>
@@ -348,4 +348,26 @@ export function SpatialPanel({ player }: SpatialPanelProps) {
       {s && (mode !== 'off' || s.before) && <MetricsTable before={s.before} after={mode === 'off' ? null : s.after} status={s} />}
     </Panel>
   )
-}
+})
+
+/** MOTION（STUDIO MODE で SPATIAL から分けて表示。中身は Phase 03 の MotionBlock） */
+export const MotionPanel = memo(function MotionPanel({ player }: SpatialPanelProps) {
+  const p = player.spatialParams
+  const active = isMotionActive(p)
+  return (
+    <Panel index="06" label="MOTION" title="音の動き" id="studio-motion" className="panel--motion" aside={<Badge tone={active ? 'live' : 'idle'}>{active ? `${MOTION_PRESET_DOCS[p.motionPreset].label} 動作中` : 'OFF'}</Badge>}>
+      <MotionBlock player={player} />
+    </Panel>
+  )
+})
+
+/** TAIL（STUDIO MODE で SPATIAL から分けて表示。中身は Phase 04 の TailBlock） */
+export const TailPanel = memo(function TailPanel({ player }: SpatialPanelProps) {
+  const p = player.spatialParams
+  const active = isTailActive(p) && p.tailMode !== 'off'
+  return (
+    <Panel index="07" label="TAIL" title="余韻（Spatial Tail）" id="studio-tail" className="panel--tail" aside={<Badge tone={active ? 'live' : 'idle'}>{active ? `${TAIL_MODE_DOCS[p.tailMode === 'off' ? 'natural' : p.tailMode].label}${p.dynamicTail ? ' + DYNAMIC' : ''}` : 'OFF'}</Badge>}>
+      <TailBlock player={player} />
+    </Panel>
+  )
+})

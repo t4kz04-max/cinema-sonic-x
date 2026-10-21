@@ -14,11 +14,11 @@
 | 05 | Spatial Preset System | 実装済み・Chrome/Edge で検証（test:preset 全 PASS。既存試験に Phase 05 の修正で現れた FAIL 4 件、下記）。試聴は未実施 |
 | 06 | Audio Export Engine | 実装済み・Chrome/Edge で検証（test:export 58/58。既存試験の CPU は環境の負荷で FAIL、下記）。試聴は未実施 |
 | 07 | Video Processing Engine | 実装済み・安定化済み・Chrome/Edge で検証（test:video 48 PASS / 1 FAIL: 続けて書き出すとメモリが一時的に積み上がる、test:export 68/68。Edge の書き出しの停止は対策後 0 回・原因は未確定、下記）。実際の動画ファイル・試聴は未確認 |
-| 08 | Simple UI + Studio | 未着手 |
+| 08 | SIMPLE MODE / STUDIO MODE（UI・UX の統合） | 実装済み・Chrome/Edge で検証（test:ui 63/63、既存試験は既知の FAIL のみ・新規 FAIL なし）。実機の目視・実際のスマートフォン・試聴は未確認 |
 | 09 | Final Quality & Release | 未着手 |
 
 最終的な製品フロー: 音声/動画をアップロード → 立体音響プリセットを選択 → 生成 → 完成表示 → 加工済みファイルを再生 → ダウンロード。
-メイン画面はシンプルにし、音響の詳細設定は /studio に分離する（Phase 08）。
+メイン画面（SIMPLE）はシンプルにし、音響の詳細設定は STUDIO（`#studio`）に分離した（Phase 08）。
 
 ---
 
@@ -296,12 +296,64 @@ source → input ─┬─ dry(1/0) ──────────────�
 - 安定化の前（2026-10-20 午後）は Edge で test:export 60〜62・68 が毎回止まり結果なし、test:video も 85・86〜87 が 1 回ずつ TIMEOUT。安定化の途中で動画の書き出しの後に 約 84 MB が戻らない不具合を入れてしまい、グループ 98 で見つけて直した（docs/SPATIAL.md）
 - 測定値のゆれ: 安定化の前の Edge の test:preset グループ 50 のメモリは 1 回 FAIL・再実行で PASS。グループ 98 で、Chrome は 4 回の書き出しで積み上がったが、Edge はこの回は積み上がらなかった（JS ヒープ 185 → 185 → 117 → 186 MB）。残る時間は回によって変わる
 
-## Phase 08 — Simple UI + Studio
+## Phase 08 — SIMPLE MODE / STUDIO MODE（UI・UX の統合）
+
+既存の立体音響・重低音・音声と動画の書き出しを 1 つの画面にまとめ、初めての人向けの SIMPLE と詳細設定の STUDIO に分けた。DSP（音響処理）の特性は変えていない（変えたのは書き出しの ENCODING の表示のための 50 ms の待ちだけ。出力の内容は同じ。下記）。
+
+**実装内容**
+- 画面のモード: ヘッダーの `SIMPLE | STUDIO` で切り替える（URL のハッシュ `#studio`。ハッシュなしは SIMPLE）。再生エンジン（AudioEngine）・DSP 設定・読み込んだファイル・書き出しの結果は `useAudioPlayer` の 1 つを両方で使い、モードの切替は表示だけを変える（再解析・再レンダリング・AudioContext の作り直しなし。test:ui で確認）
+- 書き出しの設定（ビット深度・動画の余韻・SIMPLE の動画の出力）は各パネルではなく `useAudioPlayer` の `exportOptions` に持つ（モードを切り替えても残る）
+- SIMPLE MODE（`SimpleView.tsx`）: 手順の表示（1 ファイルを選ぶ → 2 プリセットを選ぶ → 3 プレビュー → 4 加工を開始 → 5 ダウンロード、今の手順を強調）、アップロード（音声・動画を同じ欄で）、ファイル情報、プリセット 4 枚（専門用語なしの説明・向いている用途・ヘッドホン向けか）、プレビュー（再生 / 一時停止 / 停止・シーク・ORIGINAL / PROCESSED・音量）、加工（音声 → WAV 16 / 24-bit、動画 → 「立体音響の動画」または「音声だけ（立体音響化した WAV）」）、段階の表示（PREPARING → RENDERING → ENCODING →（MUXING）→ COMPLETE）、キャンセル、失敗の原因と再試行の方法・「もう一度書き出す」、完成ファイルのプレビュー（EXPORTED / ORIGINAL）・ダウンロード。詳細な DSP のパラメーターは出さない。プリセット（または CUSTOM）を選ぶまで書き出せない
+- STUDIO MODE（`StudioView.tsx`）: Phase 07 までの画面を整理し、セクションのリンク（INPUT / PLAYER / PRESET / SPATIAL / MOTION / TAIL / BASS / EXPORT、上部に固定）を付けた。SPATIAL から MOTION・TAIL を別のパネルに分けた。既存の設定項目は削除していない
+- 完成ファイルの比較（`MediaCompare.tsx`）: 書き出したファイルそのものと元のファイルを同じ位置から切り替える（60 ms のフェードアウト → フェードイン）。初期の音量はモニター音量にそろえる。再生エンジンで試聴を始めるとプレビューを止める（二重に鳴らさない）
+- スマートフォン・タブレット（`utils/platform.ts`）: 制限を画面に表示し、動画の書き出しは選べなくして理由を表示（音声の WAV は可）。WebCodecs のないブラウザも動画の書き出しを無効にする
+- 表示の修正: 書き出しのボタンが押せるときも無効の見た目だった（Phase 06 から）のを直した。アップロード欄の対応形式を実際に扱える形式（音声 WAV / MP3 ほか、動画 MP4 / MOV / WebM / MKV）に直した（以前は「MP3 / WAV」だけ）
+- テーマ: 背景を黒〜ダークグレー（無彩色寄り）に変更、アクセントはバイオレットのまま。`background-attachment: fixed` をやめた（スクロールのたびの再描画）。アニメーションは追加していない（読み込み中のスピナーのみ既存）
+- 書き出しの ENCODING の表示: 書き出し用の iframe は親と同じスレッドで動くため、ENCODING の通知の直後に同期のエンコードを始めると、親が描画する前に完了まで届き ENCODING が一度も表示されなかった（UI 試験で発見）。通知の後に 50 ms 譲るようにした（`renderExport.ts`。出力の内容は同じ）
+
+**パフォーマンス**
+- 再生位置・メーター（毎フレーム変わる値）を React の状態から外し（`hooks/playbackClock.ts` の小さなストア）、購読する部品（時刻・波形・シークバー・メーター）だけを再描画する。`useAudioPlayer` の返す値をメモ化し、各パネルを `React.memo` にした。以前は再生中に毎フレーム画面のすべてのパネルを再描画していた
+- 再生中のメインスレッドの時間（Chrome、30 秒の音源・IMMERSIVE X、同じ手順で 3 回 × 5 秒を 2 回）: Phase 07 の画面 スクリプト 55〜59 %・タスク 74〜80 % → STUDIO 19〜21 %・40〜41 % → SIMPLE 13〜14 %・24〜26 %（ヘッドレス・GPU なしの値。STUDIO はベクトルスコープ・Motion の表示などの描画を含む）
+- 波形のピークは音源ごとに 1 回だけ計算（モードの切替で全サンプルを読み直さない）。STUDIO だけの表示（ベクトルスコープ・Motion の表示・スペクトル）は SIMPLE では作らない（描画のタイマーも動かない）
+- モードの切替: クリック → 表示 25〜95 ms。切替で OfflineAudioContext・AudioContext・Object URL は作られない（6 回切り替えて 0 個）
+- Object URL: 完成ファイル・元のファイルは次の書き出し・読み込み・アンマウントで解放（読み込み直した後に残るのは新しい元のファイルの 1 つだけ。test:ui で確認）
+- HRTF の保持・書き出しの監視（タイムアウト）・キャンセル・メモリの上限は変えていない
+
+**操作方法**
+- SIMPLE: ① 音声・動画ファイルをドロップ（またはクリックして選択）→ ② 4 つのカードから 1 つ選ぶ（すぐに試聴の音に反映）→ ③ 再生して ORIGINAL / PROCESSED を聴き比べる（B キー・Space も可）→ ④「〇〇 で WAV を作る」（動画は「立体音響の動画を作る / 音声だけ取り出す」を選んでから「作る」）→ ⑤ 完成ファイルを EXPORTED / ORIGINAL で試聴し「ダウンロード」
+- STUDIO: ヘッダーの STUDIO（または URL に `#studio`）。上部のリンクで各セクションへ移動。PRESET で選んだ後に SPATIAL / MOTION / TAIL / BASS を変えると CUSTOM になる（保存も可）。EXPORT で WAV 16 / 24-bit、VIDEO で元の音声の WAV・立体音響化した WAV・動画（余韻: 映像の長さを保つ / 最後のフレームを延ばす）
+- SIMPLE に戻ると、STUDIO で調整した設定は「CUSTOM（〇〇 を STUDIO で調整）」と表示され、そのまま書き出せる。カードを選ぶとプリセットの設定に戻る
+
+**試験**: `npm run test:ui`（`scripts/run-ui-test.mjs`。実際のアプリを開いて操作する。音声 / 動画の 2 セッション、63 項目）。試験用の WAV は Node で合成、動画は WebCodecs でブラウザ内で作り、ファイルの選択（DevTools Protocol の setFileInputFiles）で読み込む。項目: SIMPLE / STUDIO の表示、モードの切替（再解析・AudioContext の作成なし）、状態の保持（ファイル・プリセット・CUSTOM・再生位置・音量・書き出し設定・完成ファイル）、音声 / 動画のアップロード、プリセット、CUSTOM、ORIGINAL / PROCESSED、再生操作、WAV / 動画の書き出し（段階の表示・WAV のヘッダーと長さ・MP4）、完成ファイルのプレビュー、ダウンロード（保存されたファイルのサイズ）、キャンセルと再書き出し、エラー表示、画面サイズ 5 種（1920 / 1366 / 1024 / 768 / 390 px）とスマートフォンの制限、ページのエラーなし。CPU・切替の時間・メモリは INFO（合否なし）
 
 **完了条件**
-- [ ] メイン画面: アップロード → プリセット選択 → 生成 → 完成表示 → 再生 → ダウンロード の一本道
-- [ ] /studio: 重低音・空間・Motion の詳細設定と測定表示（現在の画面を整理して移す）
-- [ ] 処理中の進捗・失敗時のエラー表示、日本語 UI、PC の Chrome / Edge で操作確認
+- [x] SIMPLE MODE が使える（アップロード → プリセット → プレビュー → 加工 → ダウンロード）
+- [x] STUDIO MODE が使える（SPATIAL / MOTION / TAIL / BASS / EXPORT の詳細設定と測定表示）
+- [x] モードの切替で設定・ファイル・再生位置・音量・書き出し設定・完成ファイルが失われない（再解析・再レンダリングなし）
+- [x] 音声・動画を読み込める（試験用の WAV・試験用に生成した MP4）
+- [x] 4 プリセットを選択できる / 詳細設定を変更できる（CUSTOM）
+- [x] 音声を書き出せる / 動画を書き出せる / 完成ファイルをダウンロードできる
+- [x] Chrome / Edge で検証（test:ui、ヘッドレス）・build / lint
+- [x] Edge の既存試験（最初の回帰試験で空きメモリ不足のため中断した test:preset の 11 セッション・test:spatial・test:tail・test:dsp は、2026-10-21 09:08〜09:26 に空きメモリ 5.3〜5.8 GB で実行）
+- [ ] 実機の画面での目視の確認（未実施。確認はヘッドレスの画面写真のみ）・実際のスマートフォン・タブレットでの確認（未実施。画面サイズとユーザーエージェントの模擬のみ）
+- [ ] 実際の動画ファイル・実楽曲での試聴（未実施）
+
+**試験結果（2026-10-21、Chrome / Edge、1 つずつ実行）**
+
+| スイート | Chrome 155.0.8059.85 | Edge 155.0.4283.62 |
+| --- | --- | --- |
+| test:ui（新規、2 セッション） | 63 / 63 PASS（3 回: 2 回目・回帰試験の中・最後の文言の修正の後） | 63 / 63 PASS（同じく 3 回） |
+| test:video（6 セッション） | 48 PASS / 1 FAIL（既知: グループ 88 のメモリ 720 → 998 → 1068 MB）。ブラウザのピーク 1363 MB | 48 PASS / 1 FAIL（既知: グループ 88 955 → 987 → 1055 MB）。ピーク 1445 MB。止まった回 0 |
+| test:export（9 セッション） | 68 / 68 PASS | 68 / 68 PASS |
+| test:preset（13 セッション） | すべて PASS | すべて PASS（最初の回帰試験で 2 セッション PASS の後、空きメモリ不足で中断。残り 11 セッションを後で実行してすべて PASS） |
+| test:spatial | Spatial 50 PASS、Motion 50 / 54（既知の 4 件） | Chrome と同じ（既知の 4 件） |
+| test:tail | 96 / 97（既知の 1 件） | 96 / 97（既知の 1 件） |
+| test:dsp | 62 / 63（既知の 1 件: EDM 相当） | 62 / 63（既知の 1 件） |
+| build / lint | 成功 / 警告 0 | — |
+
+- 既知の FAIL（Phase 05〜07 と同じ項目。基準は変えていない）: test:spatial の Motion 4 件（Phase 04: 既定値での ILD 変化幅、HALL × CINEMATIC / ORBIT / SWEEP のラウドネス）、test:tail 1 件（HALL × SWEEP × RIPPLE + DYNAMIC）、test:dsp 1 件（EDM 相当）、test:video グループ 88（メモリの一時的な保持）
+- 新規 FAIL: なし（Chrome / Edge とも全スイート）
+- test:ui の CPU（INFO）は PC の負荷で変わる: 回帰試験の前 SIMPLE 14 % / STUDIO 21 %、最後の実行（空きメモリが減っていた時）SIMPLE 23 % / STUDIO 36 %
 
 ## Phase 09 — Final Quality & Release
 

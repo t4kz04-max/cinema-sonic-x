@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { MODE_SPECS, paramsToGains, type BassMode, type CompensationMode } from '../audio/bassSpec'
 import type { AudioPlayer } from '../hooks/useAudioPlayer'
 import { formatDb } from '../utils/format'
@@ -66,8 +67,8 @@ const COMPENSATIONS: { id: CompensationMode; label: string }[] = [
   { id: 'loudness-match', label: 'ラウドネス一致（A/B比較用）' },
 ]
 
-export function EnhancementPanel({ player }: EnhancementPanelProps) {
-  const { bassParams, dsp, meters, bassEnabled } = player
+export const EnhancementPanel = memo(function EnhancementPanel({ player }: EnhancementPanelProps) {
+  const { bassParams, dsp, bassEnabled } = player
   // 重低音エンジンが OFF、または全体が ORIGINAL のときは処理されない
   const bypass = player.bypass || !bassEnabled
   const spec = MODE_SPECS[bassParams.mode]
@@ -77,8 +78,9 @@ export function EnhancementPanel({ player }: EnhancementPanelProps) {
 
   return (
     <Panel
-      index="06"
-      label="ENHANCE"
+      index="08"
+      label="BASS"
+      id="studio-bass"
       title="重低音エンジン"
       className={`panel--enhance${extreme ? ' is-extreme' : ''}`}
       aside={!bassEnabled ? <Badge tone="idle">ENGINE OFF</Badge> : bypass ? <Badge tone="idle">ORIGINAL 試聴中</Badge> : <Badge tone="live">処理ON・{spec.label}</Badge>}
@@ -177,8 +179,8 @@ export function EnhancementPanel({ player }: EnhancementPanelProps) {
 
       <div className="enhance-bottom">
         <EqCurve params={bassParams} scale={scale} trimDb={dsp?.trimDb ?? 0} bypass={bypass} />
-        <OutputStage dsp={dsp} meters={meters} mode={bassParams.mode} bypass={bypass} />
+        <OutputStage dsp={dsp} clock={player.clock} mode={bassParams.mode} bypass={bypass} />
       </div>
     </Panel>
   )
-}
+})

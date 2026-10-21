@@ -1,18 +1,18 @@
 :root {
-  /* 背景: 黒〜ダークネイビー */
-  --bg-0: #05060b;
-  --bg-1: #090c17;
-  --panel: #0d1222;
-  --panel-2: #111830;
-  --inset: #070a14;
-  --line: #1c2440;
-  --line-strong: #2a3459;
+  /* 背景: 黒〜ダークグレー（Phase 08 で映像制作ソフトに近い無彩色寄りに変更。わずかに青みを残す） */
+  --bg-0: #060607;
+  --bg-1: #0b0b0e;
+  --panel: #111215;
+  --panel-2: #16171b;
+  --inset: #09090b;
+  --line: #24262c;
+  --line-strong: #34363e;
 
-  /* テキスト */
-  --text: #c9cee3;
-  --text-strong: #f2f3fa;
-  --text-dim: #7d86a8;
-  --text-faint: #4f5878;
+  /* テキスト（背景とのコントラスト比: text 約 12:1、text-dim 約 5.6:1） */
+  --text: #d4d6dd;
+  --text-strong: #f5f5f7;
+  --text-dim: #9a9ca8;
+  --text-faint: #6c6f7a;
 
   /* アクセント: バイオレット */
   --accent: #8b5cf6;
@@ -49,11 +49,11 @@
 body {
   margin: 0;
   min-height: 100vh;
+  /* background-attachment: fixed はスクロールのたびに背景を描き直すため使わない（CPU 負荷） */
   background:
-    radial-gradient(1200px 600px at 75% -10%, rgba(91, 61, 196, 0.16), transparent 60%),
-    radial-gradient(900px 500px at -10% 110%, rgba(40, 62, 140, 0.18), transparent 60%),
-    linear-gradient(180deg, var(--bg-1), var(--bg-0));
-  background-attachment: fixed;
+    radial-gradient(1200px 500px at 70% -10%, rgba(91, 61, 196, 0.1), transparent 60%),
+    linear-gradient(180deg, var(--bg-1), var(--bg-0) 600px);
+  background-color: var(--bg-0);
 }
 
 h1,

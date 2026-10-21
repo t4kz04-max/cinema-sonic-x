@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { derivedDspValues, getPreset, presetToDsp, SPATIAL_PRESETS } from '../audio/presets/spatialPresets'
 import type { AudioPlayer } from '../hooks/useAudioPlayer'
 import type { DspStatus } from '../types/audio'
@@ -27,7 +28,7 @@ function loudnessRow(dsp: DspStatus | null, bassEnabled: boolean, spatialOn: boo
   return { label: 'ラウドネス差', value: '処理なし（0 LU）' }
 }
 
-export function PresetPanel({ player }: PresetPanelProps) {
+export const PresetPanel = memo(function PresetPanel({ player }: PresetPanelProps) {
   const { presetState: ps, bypass, dsp, dspConfig } = player
   const active = ps.activeId ? getPreset(ps.activeId) : null
   const base = ps.source?.kind === 'preset' ? getPreset(ps.source.id) : null
@@ -44,6 +45,7 @@ export function PresetPanel({ player }: PresetPanelProps) {
   return (
     <Panel
       index="04"
+      id="studio-preset"
       label="PRESET"
       title="空間音響プリセット"
       className="panel--preset"
@@ -170,4 +172,4 @@ export function PresetPanel({ player }: PresetPanelProps) {
       </div>
     </Panel>
   )
-}
+})

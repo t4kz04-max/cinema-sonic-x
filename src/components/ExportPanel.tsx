@@ -1,74 +1,23 @@
-import { useRef, useState } from 'react'
+import { memo } from 'react'
 import { estimateExportBytes, exportMemoryBudget, reverbTailSeconds } from '../audio/export/exportSpec'
 import { wavDataBytes, type WavBitDepth } from '../audio/export/wavEncoder'
-import { getPreset } from '../audio/presets/spatialPresets'
 import type { AudioPlayer } from '../hooks/useAudioPlayer'
 import { FORMAT_SUPPORT } from '../utils/fileValidation'
 import { formatBytes, formatHz, formatTime } from '../utils/format'
+import { ExportError, StageTrack } from './exportCommon'
+import { settingsLabel, STAGE_LABEL } from './exportLabels'
+import { MediaCompare } from './MediaCompare'
 import { Badge, Panel } from './Panel'
 
 interface ExportPanelProps {
   player: AudioPlayer
 }
 
-const STAGE_LABEL = { preparing: 'PREPARING', rendering: 'RENDERING', encoding: 'ENCODING' } as const
-
-/** 現在の設定の名前（ファイル名・表示に使う） */
-function settingsLabel(player: AudioPlayer): string {
-  const ps = player.presetState
-  if (ps.activeId) return getPreset(ps.activeId).label
-  if (ps.savedActive) return 'CUSTOM（保存）'
-  if (ps.custom) return 'CUSTOM'
-  return player.spatialParams.mode === 'off' ? 'ORIGINAL 相当（空間 OFF）' : '手動設定'
-}
-
-/**
- * 書き出した WAV そのもの（Object URL）と元のファイルを、<audio> で再生する（再生用の DSP は通さない）。
- * EXPORTED / ORIGINAL の切替は同じ時刻から（書き出しは処理の遅延を先頭で切り捨ててあるので時刻がそろう）
- */
-function ExportPreview({ url, original, onPlay }: { url: string; original: string | null; onPlay: () => void }) {
-  const exported = useRef<HTMLAudioElement>(null)
-  const orig = useRef<HTMLAudioElement>(null)
-  const [which, setWhich] = useState<'exported' | 'original'>('exported')
-  const switchTo = (next: 'exported' | 'original') => {
-    if (next === which) return
-    const from = which === 'exported' ? exported.current : orig.current
-    const to = next === 'exported' ? exported.current : orig.current
-    if (from && to) {
-      const playing = !from.paused
-      from.pause()
-      to.currentTime = Math.min(from.currentTime, Number.isFinite(to.duration) ? to.duration : from.currentTime)
-      if (playing) void to.play()
-    }
-    setWhich(next)
-  }
-  return (
-    <div className="export-preview">
-      <div className="ab-switch" role="radiogroup" aria-label="プレビューする音">
-        <button type="button" role="radio" aria-checked={which === 'exported'} className={`ab-switch__item${which === 'exported' ? ' is-active' : ''}`} onClick={() => switchTo('exported')}>
-          EXPORTED
-        </button>
-        <button
-          type="button"
-          role="radio"
-          aria-checked={which === 'original'}
-          disabled={!original}
-          className={`ab-switch__item${which === 'original' ? ' is-active is-original' : ''}`}
-          onClick={() => switchTo('original')}
-        >
-          ORIGINAL
-        </button>
-      </div>
-      <audio ref={exported} controls src={url} preload="auto" hidden={which !== 'exported'} onPlay={onPlay} data-preview="exported" />
-      {original && <audio ref={orig} controls src={original} preload="auto" hidden={which !== 'original'} onPlay={onPlay} data-preview="original" />}
-      <p className="output-stage__note">書き出した WAV ファイルそのものを再生します（再生用の空間処理・重低音は通しません）。ORIGINAL は読み込んだ元のファイルです。</p>
-    </div>
-  )
-}
-
-export function ExportPanel({ player }: ExportPanelProps) {
+/** 音声の書き出し（STUDIO MODE）。設定（ビット深度）は useAudioPlayer の exportOptions に持ち、SIMPLE と共有する */
+export const ExportPanel = memo(function ExportPanel({ player }: ExportPanelProps) {
   const { audio, exportState: ex, spatialParams, originalUrl } = player
-  const [bitDepth, setBitDepth] = useState<WavBitDepth>(16)
+  const { bitDepth } = player.exportOptions
+  const setBitDepth = (d: WavBitDepth) => player.setExportOptions({ bitDepth: d })
 
   const running = ex.state === 'running'
   const label = settingsLabel(player)
@@ -92,7 +41,7 @@ export function ExportPanel({ player }: ExportPanelProps) {
     )
 
   return (
-    <Panel index="08" label="EXPORT" title="書き出し" className="panel--export" aside={badge}>
+    <Panel index="10" label="EXPORT" id="studio-export" title="書き出し" className="panel--export" aside={badge}>
       <dl className="spec-list spec-list--compact">
         <div className="spec-list__row">
           <dt>設定</dt>
@@ -149,33 +98,18 @@ export function ExportPanel({ player }: ExportPanelProps) {
       </div>
 
       {ex.state === 'running' && (
-        <div className="export-progress" role="status">
-          <div className="export-stages">
-            {(['preparing', 'rendering', 'encoding'] as const).map((s) => (
-              <span key={s} className={ex.progress.stage === s ? 'is-current' : ''}>
-                {STAGE_LABEL[s]}
-              </span>
-            ))}
-          </div>
-          {ex.progress.stage === 'rendering' && ex.progress.rendered !== undefined && (
-            <>
-              <div className="export-bar">
-                <span style={{ width: `${(ex.progress.rendered * 100).toFixed(1)}%` }} />
-              </div>
-              <p className="output-stage__note mono">レンダリング済み {(ex.progress.rendered * 100).toFixed(0)}%（OfflineAudioContext で実際に描画し終えた時刻）</p>
-            </>
-          )}
-        </div>
+        <StageTrack
+          stages={['preparing', 'rendering', 'encoding']}
+          current={ex.progress.stage}
+          fraction={ex.progress.stage === 'rendering' ? ex.progress.rendered : undefined}
+          fractionLabel="レンダリング済み（OfflineAudioContext で実際に描画し終えた時刻）"
+        />
       )}
-      {ex.state === 'error' && (
-        <p className="notice">
-          {ex.message}
-          {ex.detail && <small> {ex.detail}</small>}
-        </p>
-      )}
+      {ex.state === 'error' && <ExportError message={ex.message} detail={ex.detail} onRetry={() => void player.exportWav(bitDepth, label)} />}
       {ex.state === 'cancelled' && <p className="output-stage__note">キャンセルしました（ファイルは作成していません）。</p>}
       {ex.state === 'complete' && (
         <div className="export-done">
+          <StageTrack stages={['preparing', 'rendering', 'encoding']} current="complete" />
           <p className="export-done__title">PROCESSING COMPLETE</p>
           <dl className="spec-list spec-list--compact">
             <div className="spec-list__row">
@@ -209,7 +143,15 @@ export function ExportPanel({ player }: ExportPanelProps) {
           <a className="btn-export btn-export--download" href={ex.url} download={ex.fileName}>
             WAV をダウンロード
           </a>
-          <ExportPreview url={ex.url} original={originalUrl} onPlay={player.pause} />
+          <MediaCompare
+            kind="audio"
+            exportedUrl={ex.url}
+            originalUrl={originalUrl}
+            enginePlaying={player.status === 'playing'}
+            onPlay={player.pause}
+            volume={player.volume}
+            note="書き出した WAV ファイルそのものを再生します（再生用の空間処理・重低音は通しません）。ORIGINAL は読み込んだ元のファイルです。"
+          />
         </div>
       )}
 
@@ -236,4 +178,4 @@ export function ExportPanel({ player }: ExportPanelProps) {
       </div>
     </Panel>
   )
-}
+})

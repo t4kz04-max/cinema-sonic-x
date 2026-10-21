@@ -1,10 +1,11 @@
 import { MODE_SPECS, type BassMode } from '../audio/bassSpec'
-import type { DspMeters, DspStatus } from '../types/audio'
+import type { DspStatus } from '../types/audio'
+import { usePlaybackClock, type PlaybackClock } from '../hooks/playbackClock'
 import { formatDb } from '../utils/format'
 
 interface OutputStageProps {
   dsp: DspStatus | null
-  meters: DspMeters
+  clock: PlaybackClock
   mode: BassMode
   bypass: boolean
 }
@@ -43,7 +44,18 @@ function GrMeter({ label, valueDb, budgetDb }: { label: string; valueDb: number;
   )
 }
 
-export function OutputStage({ dsp, meters, mode, bypass }: OutputStageProps) {
+/** ゲインリダクションのメーター（再生中は毎フレーム更新。この部分だけを再描画する） */
+function LiveGrMeters({ clock, bypass, budgetDb }: { clock: PlaybackClock; bypass: boolean; budgetDb: number }) {
+  const { meters } = usePlaybackClock(clock)
+  return (
+    <>
+      <GrMeter label="低域コンプ" valueDb={bypass ? 0 : meters.bassGrDb} />
+      <GrMeter label="リミッター" valueDb={bypass ? 0 : meters.limiterGrDb} budgetDb={budgetDb} />
+    </>
+  )
+}
+
+export function OutputStage({ dsp, clock, mode, bypass }: OutputStageProps) {
   const spec = MODE_SPECS[mode]
   const status = dsp?.analysis ?? 'idle'
   const scale = (dsp?.capScale ?? 1) * (dsp?.safetyScale ?? 1)
@@ -99,8 +111,7 @@ export function OutputStage({ dsp, meters, mode, bypass }: OutputStageProps) {
           </p>
         ) : (
           <>
-            <GrMeter label="低域コンプ" valueDb={bypass ? 0 : meters.bassGrDb} />
-            <GrMeter label="リミッター" valueDb={bypass ? 0 : meters.limiterGrDb} budgetDb={spec.budget.maxLimiterGrDb} />
+            <LiveGrMeters clock={clock} bypass={bypass} budgetDb={spec.budget.maxLimiterGrDb} />
             <p className="output-stage__spec mono">
               低域コンプ: {spec.bassComp.ratio}:1 · しきい値 {dsp?.bassThresholdDb != null ? `${dsp.bassThresholdDb.toFixed(1)} dBFS` : '—'} · 150 Hz 以下のみ
             </p>

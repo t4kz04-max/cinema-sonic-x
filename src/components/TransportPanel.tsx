@@ -1,12 +1,10 @@
-import { useState } from 'react'
+import { memo } from 'react'
 import type { AudioPlayer } from '../hooks/useAudioPlayer'
-import { volumePercentToGain } from '../hooks/useAudioPlayer'
-import { formatDb, formatTime, gainToDb } from '../utils/format'
 import { isTailActive, TAIL_MODE_DOCS } from '../audio/spatial/spatialSpec'
-import { CutIcon, LoopIcon, PauseIcon, PlayIcon, StopIcon, VolumeIcon } from './Icons'
+import { CutIcon, LoopIcon, PauseIcon, PlayIcon, StopIcon } from './Icons'
 import { Badge, Panel } from './Panel'
-import { RangeControl } from './RangeControl'
-import { Waveform } from './Waveform'
+import { PlaybackTimeline } from './PlaybackTimeline'
+import { VolumeControl } from './VolumeControl'
 
 interface TransportPanelProps {
   player: AudioPlayer
@@ -45,8 +43,8 @@ function nodeClass(kind: NodeKind, bypass: boolean): string {
   return 'is-active'
 }
 
-export function TransportPanel({ player }: TransportPanelProps) {
-  const { audio, status, position, duration, volume, bypass, dsp, bassEnabled, spatialParams, loop } = player
+export const TransportPanel = memo(function TransportPanel({ player }: TransportPanelProps) {
+  const { audio, status, bypass, dsp, bassEnabled, spatialParams, loop } = player
   const bassPath = dsp?.dynamicsEngine === 'fallback' ? FALLBACK_PATH : SIGNAL_PATH
   // VOLUME / OUTPUT の手前に空間処理を入れて表示する
   const path = [
@@ -57,21 +55,12 @@ export function TransportPanel({ player }: TransportPanelProps) {
       : []),
     ...bassPath.slice(-2),
   ]
-  // シークバーのドラッグ中は表示だけ更新し、離した時点でシークする（ソース再生成によるノイズ防止）
-  const [scrub, setScrub] = useState<number | null>(null)
-  const shown = scrub ?? position
   const disabled = !audio
-  const volumeDb = formatDb(gainToDb(volumePercentToGain(volume)))
-
-  const commitScrub = () => {
-    if (scrub === null) return
-    player.seek(scrub)
-    setScrub(null)
-  }
 
   return (
     <Panel
       index="03"
+      id="studio-transport"
       label="TRANSPORT"
       title="プレイヤー"
       className="panel--transport"
@@ -82,31 +71,7 @@ export function TransportPanel({ player }: TransportPanelProps) {
         </>
       }
     >
-      <div className="time-display" aria-live="off">
-        <span className="time-display__current mono">{formatTime(shown, true)}</span>
-        <span className="time-display__sep">/</span>
-        <span className="time-display__total mono">{formatTime(duration, true)}</span>
-      </div>
-
-      <Waveform
-        buffer={audio?.buffer ?? null}
-        progress={duration > 0 ? shown / duration : 0}
-        onSeekRatio={(r) => player.seek(r * duration)}
-      />
-
-      <RangeControl
-        id="seek"
-        className="range--seek"
-        min={0}
-        max={duration || 1}
-        step={0.01}
-        value={shown}
-        disabled={disabled}
-        ariaLabel="再生位置"
-        ariaValueText={`${formatTime(shown)} / ${formatTime(duration)}`}
-        onChange={setScrub}
-        onCommit={commitScrub}
-      />
+      <PlaybackTimeline player={player} idPrefix="studio" />
 
       <div className="transport-row">
         <div className="ab-switch" role="radiogroup" aria-label="試聴する音（B キーで切替）">
@@ -162,25 +127,7 @@ export function TransportPanel({ player }: TransportPanelProps) {
           </button>
         </div>
 
-        <div className="volume">
-          <label htmlFor="volume" className="volume__label">
-            <VolumeIcon /> 音量
-          </label>
-          <RangeControl
-            id="volume"
-            className="range--volume"
-            min={0}
-            max={100}
-            step={1}
-            value={volume}
-            ariaLabel="音量"
-            ariaValueText={`${volume}%（${volumeDb}）`}
-            onChange={player.setVolume}
-          />
-          <span className="volume__value mono">
-            {volume}%<small>{volumeDb}</small>
-          </span>
-        </div>
+        <VolumeControl player={player} idPrefix="studio" />
       </div>
 
       <div className="signal-path" aria-label="現在の信号経路">
@@ -196,4 +143,4 @@ export function TransportPanel({ player }: TransportPanelProps) {
       </div>
     </Panel>
   )
-}
+})

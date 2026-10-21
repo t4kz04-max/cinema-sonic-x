@@ -205,11 +205,17 @@ export async function renderExportFloat(req: ExportRequest, onProgress: (p: Expo
   return { channels, sourceSeconds, tailSeconds: channels[0].length / sr - sourceSeconds, headTrimSeconds: head / sr, renderMs }
 }
 
+/** ENCODING の表示のために親へ譲る時間（ms）。出力の内容には影響しない */
+const ENCODE_STAGE_YIELD_MS = 50
+
 /** レンダリング → WAV */
 export async function renderExport(req: ExportRequest, onProgress: (p: ExportProgress) => void = () => {}, opts: RenderOptions = {}): Promise<ExportResult> {
   const { trace = () => {}, attempt = 1 } = opts
   const r = await renderExportFloat(req, onProgress, opts)
   onProgress({ stage: 'encoding' })
+  // 書き出し用の iframe は親と同じスレッドで動くため、すぐに同期のエンコードを始めると、親が ENCODING を
+  // 描画する前に完了の通知まで届き、画面に ENCODING が出ない（Phase 08 の UI 試験で発見）。親が描画できるよう一度譲る
+  await new Promise((r) => setTimeout(r, ENCODE_STAGE_YIELD_MS))
   const { blob, stats } = await step(trace, 'encode', async () => {
     await stallIf(req, 'encode', attempt)
     return req.encodeWav === false ? { blob: new Blob([]), stats: { clippedSamples: 0, dataBytes: 0 } } : encodeWav(r.channels, { sampleRate: req.sampleRate, bitDepth: req.bitDepth, dither: true, seed: req.ditherSeed })

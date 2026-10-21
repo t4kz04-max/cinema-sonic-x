@@ -58,9 +58,11 @@ src/
     videoMux.ts        映像パケットのコピー + 加工済み音声のエンコード（余韻: 映像の長さを保つ / 最後のフレームを延ばす）
     videoExport.ts     Phase 06 の書き出し（WAV を作らず浮動小数点で受け取る）→ videoMux
   dev/         DSP 自己診断（tests/dsp-selftest.html から実行。本番ビルドに含まれない）
-  hooks/       React と audio 層の橋渡し（useAudioPlayer）
+  hooks/       React と audio 層の橋渡し（useAudioPlayer）、playbackClock（再生位置・メーターの小さなストア）
   components/  表示とユーザー操作のみ。音声ノードを直接触らない
-  utils/       純粋関数（ヘッダー解析・フォーマット・検証）、customPresetStorage（CUSTOM のブラウザ内保存）
+               SimpleView（SIMPLE MODE）/ StudioView（STUDIO MODE: 既存の各パネル）/ MediaCompare（完成ファイルと元のファイルの比較再生）/
+               exportCommon・exportLabels（書き出しの段階の表示・エラーと再試行・設定名）/ PlaybackTimeline・VolumeControl（両モード共通）
+  utils/       純粋関数（ヘッダー解析・フォーマット・検証）、customPresetStorage（CUSTOM のブラウザ内保存）、platform（スマートフォン・WebCodecs の有無による制限）
   types/       共有型
 docs/PHASES.md 開発計画
 ```
@@ -103,6 +105,11 @@ docs/PHASES.md 開発計画
 - 動画のモジュール（src/video、mediabunny）は動的 import で読み込み、メインのバンドルに入れない。
 - Matroska（WebM / MKV）の出力は SimpleBlock に長さがないため、入力が固定フレームレートのときだけ frameRate を渡す（渡さないと最後のフレームの長さが 0 になる）。最後のフレームの延長は Matroska ではファイル全体の長さでしか表せない。
 - 動画の書き出しも Phase 06 の書き出し（使い捨ての iframe・suspendForExport）を使い、動画専用の DSP を作らない。映像の長さは利用者が選んだときだけ変える（既定は映像の長さを保つ）。
+- 画面は SIMPLE MODE（既定）と STUDIO MODE（URL のハッシュ `#studio`）。両方で同じ `useAudioPlayer`（同じ AudioEngine・DSP 設定・読み込んだファイル・書き出しの結果）を使い、モードの切替は表示だけを変える。切替で再解析・再レンダリング・AudioContext の作成を起こさない（test:ui で確認）。モードをまたいで残す UI の状態（書き出しの設定など）は各パネルの useState ではなく `useAudioPlayer`（`exportOptions`）に持つ。
+- 再生位置・メーターのように毎フレーム変わる値は React の状態にしない（`playbackClock` を必要な部品だけが購読する）。`useAudioPlayer` の返す値はメモ化し、パネルは `React.memo` にする。パネルに毎回作り直すインライン関数・オブジェクトを渡さない（メモ化が効かなくなり、再生中に全パネルが再描画される。Phase 07 までの画面は再生中のメインスレッドのスクリプト時間が約 56 %、Phase 08 で SIMPLE 約 13 % / STUDIO 約 20 %）。
+- SIMPLE には詳細な DSP のパラメーターを出さない。プリセットの説明文は SIMPLE 用の UI の文言（SimpleView の SIMPLE_COPY）で、凍結したプリセットのデータは変えない。SIMPLE ではプリセット（または CUSTOM）を選ぶまで書き出させない。
+- スマートフォン・タブレット・WebCodecs のないブラウザでは動画の書き出しを無効にして理由を表示する（`utils/platform.ts`）。無理にすべての端末で動画の処理をさせない。
+- 書き出しの段階の表示は実際の段階だけ（推定のアニメーションを使わない）。書き出し用の iframe は親と同じスレッドなので、親に表示させたい段階の通知の直後に長い同期処理を始めない（renderExport は ENCODING の通知の後に 50 ms 譲る。譲らないと ENCODING が一度も描画されない）。
 - `decodeAudioData` は AudioContext のサンプルレートへリサンプルする。元ファイルの値はヘッダー解析結果として別に扱い、UIでは区別して表示する。
 
 ## エラー処理
@@ -116,7 +123,7 @@ docs/PHASES.md 開発計画
 - TypeScript: `any` を使わない。`erasableSyntaxOnly` のため `enum`・パラメータプロパティは使わない（union型を使う）。
 - コメントは日本語可。「なぜそうしたか」を書く。
 - CSSはプレーンCSS（`src/index.css` のトークン + `src/App.css`）。色は `:root` のCSS変数を使う。
-- テーマ: 黒・ダークネイビー基調、アクセントはバイオレット。PC横幅を活かしたレイアウト。
+- テーマ: 黒・ダークグレー基調（Phase 08 で無彩色寄りに変更）、アクセントはバイオレット。PC横幅を活かしたレイアウト。スマートフォン幅（〜600px）まで横にはみ出さない。過剰なアニメーション・`background-attachment: fixed` など描画の負荷を増やすものは使わない。
 
 ## 作業の完了確認
 
@@ -126,6 +133,7 @@ docs/PHASES.md 開発計画
 - 書き出しを変更したら `npm run test:export`（Phase 06。WAV・余韻・Motion の再現・リアルタイムとの一致・メモリ・キャンセル・監視と打ち切り（グループ 72）。9 セッション）を実行する。
 - 動画の処理を変更したら `npm run test:video`（Phase 07。読み込み・抽出・WAV・ストリームコピー・同期・余韻・キャンセル・メモリ・プレビュー・監視と打ち切り（グループ 90）。6 セッション）を実行する。試験の動画は WebCodecs で生成する（src/dev/videoFixtures.ts）。グループ 88 のメモリは既知の FAIL（リークではなく書き出しの後 20〜40 秒の一時的な保持。docs/SPATIAL.md）。メモリの内訳の診断（グループ 98、合否なし）は通常の test:video に含めず `npm run test:video:diagnostic` で実行する。試験用のページの調査用の指定: `nohrtfkeeper=1`（HRTF の保持なしで比較）・`traceaudio=1`（ページ内のレンダリングの開始・完了を出す）。
 - 書き出しの監視で打ち切ったときは、ランナーが `WARN` 行を表示する（グループ 72・90 は意図して止める試験なので WARN が出る）。`--log` で書き出しの段階の記録（`TRACE` 行）も表示する。スイートが TIMEOUT になったときは結果なしとして扱い、PASS と数えない。止まったブラウザの終了は試験用のプロファイル（`csx-selftest-`）のプロセスだけにする。
+- UI を変更したら `npm run test:ui`（Phase 08。`scripts/run-ui-test.mjs`: 実際のアプリをヘッドレスの Chrome / Edge で開いて操作する。音声 / 動画の 2 セッション。表示・モードの切替と状態の保持・アップロード・プリセット・CUSTOM・再生・書き出し・プレビュー・ダウンロード・キャンセル・エラー・画面サイズ）を実行する。`--session=audio|video` で一部だけ、`--screens=<フォルダー>` で確認用の画面写真を保存。CPU・切替の時間・メモリは INFO（合否なし）。
 - メモリを測る試験は、他のアプリで空きメモリが少ないと中断（ABORTED）する。実行前に空きメモリを確認する（test:video はブラウザ全体で最大 約 1.4 GB 使う。Phase 07 の測定で Chrome 1341 MB / Edge 1363 MB）。
 - プリセット・A/B 比較・CUSTOM・解析の最適化を変更したら `npm run test:preset`（Phase 05、13 のブラウザセッションに分けて順に実行）を実行する。INFO 行は合否を判定しない測定値（原因調査など）。
 - 音声処理を変更したら `npm run test:dsp`（ヘッドレス Chrome/Edge で DSP 自己診断）を実行する。既知の FAIL（EDM相当の低域絶対値、docs/PHASES.md 参照）以外が出ないことを確認する。検証項目は `src/dev/dspSelfTest.ts` に追加し、純音だけでなく楽曲相当信号（`src/dev/testSignals.ts`）でも確認する。合格基準を結果に合わせて緩めない。

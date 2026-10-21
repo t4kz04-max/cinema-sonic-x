@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { memo,useEffect, useMemo, useRef } from 'react'
 import { logFrequencies } from '../audio/eqResponse'
 import { bandLevelDb, smoothedSpectrumDb, SUMMARY_BANDS, thirdOctaveLevelsDb } from '../audio/spectrum'
 import { useElementSize } from '../hooks/useElementSize'
@@ -30,7 +30,7 @@ const COLORS = {
 const signed = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}`
 const formatFreq = (f: number) => (f >= 1000 ? `${f / 1000}k` : `${f}`)
 
-export function SpectrumPanel({ dsp, bypass }: SpectrumPanelProps) {
+export const SpectrumPanel = memo(function SpectrumPanel({ dsp, bypass }: SpectrumPanelProps) {
   const [wrapRef, size] = useElementSize<HTMLDivElement>()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const spectra = dsp?.spectra ?? null
@@ -121,7 +121,7 @@ export function SpectrumPanel({ dsp, bypass }: SpectrumPanelProps) {
 
   return (
     <Panel
-      index="07"
+      index="09" id="studio-spectrum"
       label="ANALYZER"
       title="重低音エンジン: 処理前後のスペクトル比較"
       className="panel--spectrum"
@@ -180,4 +180,4 @@ export function SpectrumPanel({ dsp, bypass }: SpectrumPanelProps) {
       </div>
     </Panel>
   )
-}
+})

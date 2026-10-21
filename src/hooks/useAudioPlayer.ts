@@ -11,10 +11,12 @@ import { estimateExportBytes, EXPORT_MAX_SECONDS, exportMemoryBudget, type Expor
 import { ExportCancelledError, ExportTimeoutError, pendingRetainedBytes, retainedReleaseWaitMs, startExport, type ExportJob } from '../audio/export/exportRunner'
 import type { WavBitDepth } from '../audio/export/wavEncoder'
 import { formatBytes } from '../utils/format'
+import { platformLimits } from '../utils/platform'
 import type { VideoExportResult, VideoJob, VideoJobProgress } from '../video/videoExport'
 import { encodeWav } from '../audio/export/wavEncoder'
 import { estimateVideoExportBytes, EXT_OF, VideoCancelledError, VideoTimeoutError, type VideoTailMode } from '../video/videoSpec'
-import type { DspMeters, DspStatus, LoadError, LoadedAudio, PlaybackStatus } from '../types/audio'
+import type { DspStatus, LoadError, LoadedAudio, PlaybackStatus } from '../types/audio'
+import { createPlaybackClock, NO_METERS } from './playbackClock'
 
 /** 初期音量（%）。gain = (40/100)^2 = 0.16 ≒ -15.9 dB と控えめにする */
 export const DEFAULT_VOLUME_PERCENT = 40
@@ -83,7 +85,17 @@ export interface PresetState {
   storageMessage: string | null
 }
 
-const NO_METERS: DspMeters = { bassGrDb: 0, limiterGrDb: 0, spatialLimiterGrDb: 0 }
+/**
+ * 書き出しの設定（画面のモードを切り替えても保つため、各パネルではなくここで持つ）。
+ * videoOutput は SIMPLE MODE で動画を読み込んだときの出力（動画 / 立体音響化した WAV）
+ */
+export interface ExportOptions {
+  bitDepth: WavBitDepth
+  videoTail: VideoTailMode
+  videoOutput: 'video' | 'wav'
+}
+
+const INITIAL_EXPORT_OPTIONS: ExportOptions = { bitDepth: 16, videoTail: 'trim', videoOutput: 'video' }
 
 export function useAudioPlayer() {
   const engineRef = useRef<AudioEngine | null>(null)
@@ -95,7 +107,8 @@ export function useAudioPlayer() {
 
   const [audio, setAudio] = useState<LoadedAudio | null>(null)
   const [status, setStatus] = useState<PlaybackStatus>('stopped')
-  const [position, setPosition] = useState(0)
+  // 再生位置・メーターは毎フレーム変わるため React の状態にしない（playbackClock.ts）
+  const [clock] = useState(createPlaybackClock)
   const [volume, setVolumeState] = useState(DEFAULT_VOLUME_PERCENT)
   const [loadingName, setLoadingName] = useState<string | null>(null)
   const [error, setError] = useState<LoadError | null>(null)
@@ -104,7 +117,6 @@ export function useAudioPlayer() {
   const [bassEnabled, setBassEnabledState] = useState(false)
   const [spatialParams, setSpatialParamsState] = useState<SpatialParams>(DEFAULT_SPATIAL_PARAMS)
   const [dsp, setDsp] = useState<DspStatus | null>(null)
-  const [meters, setMeters] = useState<DspMeters>(NO_METERS)
   const [loop, setLoopState] = useState<LoopState>(INITIAL_LOOP)
   const [musicRegion, setMusicRegion] = useState<LoopRegion | null>(null)
   const [presetSource, setPresetSource] = useState<PresetSource>(null)
@@ -121,6 +133,7 @@ export function useAudioPlayer() {
   /** 準備中（フレームを作る前）のキャンセル要求 */
   const exportCancelRef = useRef(false)
   const [videoState, setVideoState] = useState<VideoExportState>({ state: 'idle' })
+  const [exportOptions, setExportOptionsState] = useState<ExportOptions>(INITIAL_EXPORT_OPTIONS)
   const videoJobRef = useRef<VideoJob<VideoExportResult> | null>(null)
   const videoUrlRef = useRef<string | null>(null)
   const videoCancelRef = useRef(false)
@@ -130,13 +143,13 @@ export function useAudioPlayer() {
       const engine = new AudioEngine(volumePercentToGain(volumeRef.current))
       engine.onStatusChange((s) => {
         setStatus(s)
-        setPosition(engine.getPosition())
+        clock.set({ position: engine.getPosition() })
       })
       engine.onDspStatusChange(setDsp)
       engineRef.current = engine
     }
     return engineRef.current
-  }, [])
+  }, [clock])
 
   useEffect(() => {
     return () => {
@@ -151,17 +164,16 @@ export function useAudioPlayer() {
     let id = 0
     const tick = () => {
       if (engineRef.current) {
-        setPosition(engineRef.current.getPosition())
-        setMeters(engineRef.current.getMeters())
+        clock.set({ position: engineRef.current.getPosition(), meters: engineRef.current.getMeters() })
       }
       id = requestAnimationFrame(tick)
     }
     id = requestAnimationFrame(tick)
     return () => {
       cancelAnimationFrame(id)
-      setMeters(NO_METERS)
+      clock.set({ meters: NO_METERS })
     }
-  }, [status])
+  }, [status, clock])
 
   /** 書き出し結果を破棄する（Object URL を解放し、実行中ならキャンセル） */
   const resetExport = useCallback(() => {
@@ -214,12 +226,12 @@ export function useAudioPlayer() {
         engine.setBuffer(result.audio.buffer)
         setMusicRegion(engine.getMusicRegion())
         setAudio(result.audio)
-        setPosition(0)
+        clock.set({ position: 0 })
       } finally {
         if (token === loadTokenRef.current) setLoadingName(null)
       }
     },
-    [getEngine, resetExport],
+    [getEngine, resetExport, clock],
   )
 
   const play = useCallback(async () => {
@@ -257,9 +269,9 @@ export function useAudioPlayer() {
     (seconds: number) => {
       const engine = getEngine()
       engine.seek(seconds)
-      setPosition(engine.getPosition())
+      clock.set({ position: engine.getPosition() })
     },
-    [getEngine],
+    [getEngine, clock],
   )
 
   const setVolume = useCallback(
@@ -272,6 +284,8 @@ export function useAudioPlayer() {
   )
 
   const clearError = useCallback(() => setError(null), [])
+
+  const setExportOptions = useCallback((patch: Partial<ExportOptions>) => setExportOptionsState((o) => ({ ...o, ...patch })), [])
 
   const setBassParams = useCallback(
     (patch: Partial<BassParams>) => {
@@ -454,6 +468,12 @@ export function useAudioPlayer() {
     async (tailMode: VideoTailMode, settingsLabel: string) => {
       const engine = engineRef.current
       if (!engine || !audio?.video || exportRunningRef.current) return
+      // スマートフォン・WebCodecs のないブラウザでは動画を書き出さない（UI でもボタンを無効にしている）
+      const limit = platformLimits().videoExport
+      if (!limit.ok) {
+        setVideoState({ state: 'error', message: 'この端末・ブラウザでは動画を書き出せません。', detail: limit.reason })
+        return
+      }
       exportRunningRef.current = true
       videoCancelRef.current = false
       if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current)
@@ -531,56 +551,111 @@ export function useAudioPlayer() {
     [getEngine],
   )
 
-  return {
-    audio,
-    status,
-    position,
-    duration: audio?.buffer.duration ?? 0,
-    volume,
-    loadingName,
-    error,
-    contextSampleRate: audio?.buffer.sampleRate ?? null,
-    loadFile,
-    play,
-    pause,
-    stop,
-    cut,
-    loop,
-    setLoop,
-    musicRegion,
-    togglePlay,
-    seek,
-    setVolume,
-    clearError,
-    bassParams,
-    setBassParams,
-    bypass,
-    setBypass,
-    bassEnabled,
-    setBassEnabled,
-    spatialParams,
-    setSpatialParams,
-    readScope,
-    readMotion,
-    readTail,
-    dsp,
-    meters,
-    dspConfig,
-    presetState,
-    applyPreset,
-    applySavedCustom,
-    saveCurrentCustom,
-    deleteSavedCustom,
-    exportState,
-    videoState,
-    exportOriginalVideoAudio,
-    exportSpatialVideo,
-    cancelVideo,
-    originalUrl,
-    exportWav,
-    cancelExport,
-    resetExport,
-  }
+  // 返す値をまとめてメモ化する（パネルを React.memo にし、関係のない状態の変化・再生位置の更新で再描画しない）
+  const duration = audio?.buffer.duration ?? 0
+  return useMemo(
+    () => ({
+      clock,
+      duration,
+      contextSampleRate: audio?.buffer.sampleRate ?? null,
+      exportOptions,
+      setExportOptions,
+      audio,
+      status,
+      volume,
+      loadingName,
+      error,
+      loadFile,
+      play,
+      pause,
+      stop,
+      cut,
+      loop,
+      setLoop,
+      musicRegion,
+      togglePlay,
+      seek,
+      setVolume,
+      clearError,
+      bassParams,
+      setBassParams,
+      bypass,
+      setBypass,
+      bassEnabled,
+      setBassEnabled,
+      spatialParams,
+      setSpatialParams,
+      readScope,
+      readMotion,
+      readTail,
+      dsp,
+      dspConfig,
+      presetState,
+      applyPreset,
+      applySavedCustom,
+      saveCurrentCustom,
+      deleteSavedCustom,
+      exportState,
+      videoState,
+      exportOriginalVideoAudio,
+      exportSpatialVideo,
+      cancelVideo,
+      originalUrl,
+      exportWav,
+      cancelExport,
+      resetExport,
+    }),
+    [
+      clock,
+      duration,
+      exportOptions,
+      setExportOptions,
+      audio,
+      status,
+      volume,
+      loadingName,
+      error,
+      loadFile,
+      play,
+      pause,
+      stop,
+      cut,
+      loop,
+      setLoop,
+      musicRegion,
+      togglePlay,
+      seek,
+      setVolume,
+      clearError,
+      bassParams,
+      setBassParams,
+      bypass,
+      setBypass,
+      bassEnabled,
+      setBassEnabled,
+      spatialParams,
+      setSpatialParams,
+      readScope,
+      readMotion,
+      readTail,
+      dsp,
+      dspConfig,
+      presetState,
+      applyPreset,
+      applySavedCustom,
+      saveCurrentCustom,
+      deleteSavedCustom,
+      exportState,
+      videoState,
+      exportOriginalVideoAudio,
+      exportSpatialVideo,
+      cancelVideo,
+      originalUrl,
+      exportWav,
+      cancelExport,
+      resetExport,
+    ],
+  )
 }
 
 export type AudioPlayer = ReturnType<typeof useAudioPlayer>
