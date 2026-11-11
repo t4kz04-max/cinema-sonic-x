@@ -8,6 +8,9 @@ import { SourceInfoPanel } from './SourceInfoPanel'
 import { MotionPanel, SpatialPanel, TailPanel } from './SpatialPanel'
 import { SpectrumPanel } from './SpectrumPanel'
 import { TransportPanel } from './TransportPanel'
+import { demoOfSource } from '../demo/demoSpec'
+import { DemoOffer, DemoSections } from './DemoShowcase'
+import { Panel } from './Panel'
 import { UploadZone } from './UploadZone'
 import { VideoPanel } from './VideoPanel'
 
@@ -44,12 +47,18 @@ export const StudioView = memo(function StudioView({ player }: { player: AudioPl
       <main className="console">
         <div className="console__col console__col--side">
           <UploadZone loadingName={player.loadingName} error={player.error} hasAudio={audio !== null} onFile={player.loadFile} onDismissError={player.clearError} />
+          <DemoOffer player={player} compact />
           <SourceInfoPanel audio={audio} />
           <ExportPanel player={player} />
           <VideoPanel player={player} />
         </div>
         <div className="console__col console__col--main">
           <TransportPanel player={player} />
+          {demoOfSource(player.audio?.source) && (
+            <Panel index="03" label="DEMO" title="サンプル音源の区間" className="panel--demo">
+              <DemoSections player={player} />
+            </Panel>
+          )}
           <PresetPanel player={player} />
           <SpatialPanel player={player} />
           <MotionPanel player={player} />

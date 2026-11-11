@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://cinema-sonic-x.vercel.app/sitemap.xml

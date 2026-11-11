@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import './App.css'
+import { AboutSection } from './components/AboutSection'
 import { AppHeader, type ViewMode } from './components/AppHeader'
 import { SimpleView } from './components/SimpleView'
 import { StudioView } from './components/StudioView'
@@ -63,6 +64,7 @@ function App() {
     <div className={`app app--${mode}`}>
       <AppHeader mode={mode} onModeChange={setMode} />
       {mode === 'simple' ? <SimpleView player={player} onOpenStudio={openStudio} /> : <StudioView player={player} />}
+      <AboutSection />
       <footer className="app-footer">
         <span>音源・動画はお使いのブラウザ内でのみ処理されます。サーバーや外部サービスへは送信されません。</span>
         <span className="mono">CINEMA SONIC X · SIMPLE / STUDIO (Phase 08)</span>

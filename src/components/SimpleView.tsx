@@ -12,6 +12,8 @@ import { PauseIcon, PlayIcon, StopIcon } from './Icons'
 import { MediaCompare } from './MediaCompare'
 import { Badge } from './Panel'
 import { PlaybackTimeline } from './PlaybackTimeline'
+import { demoOfSource } from '../demo/demoSpec'
+import { DemoOffer, DemoSections } from './DemoShowcase'
 import { UploadZone } from './UploadZone'
 import { VolumeControl } from './VolumeControl'
 
@@ -88,8 +90,15 @@ function FileSummary({ player }: { player: AudioPlayer }) {
   ]
   if (v) rows.push(['解像度', `${v.video.width}×${v.video.height}${v.video.fps ? ` / ${v.video.fps.toFixed(0)} fps` : ''}`])
   rows.push(['ファイルサイズ', formatBytes(audio.fileSizeBytes)])
+  const demo = demoOfSource(player.audio?.source)
   return (
     <div className="file-summary" data-ui="file-summary">
+      {demo && (
+        <p className="demo-badge-row" data-ui="demo-source">
+          <span className="demo-sections__badge">公式デモ音源</span>
+          <span>{demo.title}</span>
+        </p>
+      )}
       <p className="file-name" title={audio.fileName}>
         {audio.fileName}
       </p>
@@ -159,6 +168,7 @@ function Preview({ player }: { player: AudioPlayer }) {
   return (
     <div className="simple-preview">
       <PlaybackTimeline player={player} idPrefix="simple" />
+      <DemoSections player={player} />
       <div className="simple-preview__row">
         <div className="transport-buttons">
           <button type="button" className="btn-round btn-round--primary" onClick={player.togglePlay} disabled={disabled} aria-label={status === 'playing' ? '一時停止' : '再生'} title={status === 'playing' ? '一時停止（Space）' : '再生（Space）'}>
@@ -338,6 +348,7 @@ export const SimpleView = memo(function SimpleView({ player, onOpenStudio }: Sim
             onFile={player.loadFile}
             onDismissError={player.clearError}
           />
+          <DemoOffer player={player} />
           </section>
           <section className="simple-card" aria-label="ファイル情報">
             <header className="simple-card__head">

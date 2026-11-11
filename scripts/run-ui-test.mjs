@@ -250,12 +250,16 @@ async function launch() {
   let id = 0
   const pending = new Map()
   const errors = []
+  /** CDP のイベント（Fetch.requestPaused など）の受け取り */
+  const handlers = new Map()
+  const on = (method, fn) => handlers.set(method, fn)
   ws.addEventListener('message', (ev) => {
     const m = JSON.parse(ev.data)
     if (m.id && pending.has(m.id)) {
       pending.get(m.id)(m)
       pending.delete(m.id)
     }
+    if (m.method && handlers.has(m.method)) handlers.get(m.method)(m.params)
     if (m.method === 'Runtime.exceptionThrown') errors.push(m.params.exceptionDetails.exception?.description ?? m.params.exceptionDetails.text)
     if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') errors.push(m.params.args.map((a) => a.value ?? a.description).join(' '))
   })
@@ -331,7 +335,7 @@ async function launch() {
     }
   }
   const metrics = async () => Object.fromEntries((await send('Performance.getMetrics')).result.metrics.map((m) => [m.name, m.value]))
-  return { send, ev, waitFor, setFile, shot, viewport, navigate, close, errors, download, browserMemoryMb, metrics }
+  return { send, on, ev, waitFor, setFile, shot, viewport, navigate, close, errors, download, browserMemoryMb, metrics }
 }
 
 /** 書き出しを始める（段階の表示の変化を記録する監視を付けてから押す） */
@@ -835,11 +839,226 @@ async function videoSession() {
   }
 }
 
+// ================= セッション 3: 公式デモ音源（Spatial Showcase） =================
+// 取得の失敗・競合は CDP の Fetch で応答を差し替えて再現する（実際の通信の失敗と同じ経路: fetch → アプリのエラー処理）
+const DEMO_PATH = '/audio/spatial-showcase.wav'
+async function demoSession() {
+  currentSession = 'demo'
+  if (!existsSync(join('public', 'audio', 'spatial-showcase.wav'))) {
+    check(20, 'デモ音源ファイル public/audio/spatial-showcase.wav がある', false, '音源が配置されていないため、このセッションの残りは実行しない')
+    return
+  }
+  const b = await launch()
+  try {
+    await b.navigate()
+    const demoState = () => b.ev(`({ summary: u.$('[data-ui="file-summary"]')?.innerText ?? '', badge: !!u.$('[data-ui="demo-source"]'), sections: u.$$('[data-section]').map((e) => e.dataset.section), alert: u.$('.alert[role=alert] .alert__title')?.textContent ?? '', alertAll: u.$('.alert[role=alert]')?.textContent ?? '', loading: !!u.$('.dropzone.is-loading') })`)
+    const clickDemo = () => b.ev(`(u.$('[data-ui="demo-load"]').click(), true)`)
+
+    // ---- 20. 最初の表示: デモの案内があり、音源はまだ取得しない ----
+    const d0 = await b.ev(`({ btn: u.visible(u.$('[data-ui="demo-load"]')), text: u.$('[data-ui="demo-load"]')?.innerText ?? '', fetched: performance.getEntriesByType('resource').some((e) => e.name.includes(${JSON.stringify(DEMO_PATH)})), sections: !!u.$('[data-ui="demo-sections"]'), about: !!u.$('[data-ui="about"] [lang=en]') })`)
+    check(20, 'SIMPLE に「サンプル音源で試す」があり、押す前は音源を取得しない・区間は出さない', d0.btn && /サンプル音源で試す/.test(d0.text) && !d0.fetched && !d0.sections, JSON.stringify(d0))
+    check(20, 'サイトの説明（日本語・英語）を表示', d0.about)
+
+    // ---- 21. 取得の失敗（404・WAV でない応答）→ エラーを表示し、もう一度押せる ----
+    let mode = 'off'
+    let held = null
+    b.on('Fetch.requestPaused', (p) => {
+      if (mode === '404') void b.send('Fetch.fulfillRequest', { requestId: p.requestId, responseCode: 404, responseHeaders: [{ name: 'Content-Type', value: 'text/plain' }], body: Buffer.from('not found').toString('base64') })
+      else if (mode === 'html') void b.send('Fetch.fulfillRequest', { requestId: p.requestId, responseCode: 200, responseHeaders: [{ name: 'Content-Type', value: 'text/html' }], body: Buffer.from('<!doctype html><title>x</title>').toString('base64') })
+      else if (mode === 'hold') held = p.requestId
+      else void b.send('Fetch.continueRequest', { requestId: p.requestId })
+    })
+    await b.send('Fetch.enable', { patterns: [{ urlPattern: `*${DEMO_PATH}*` }] })
+    mode = '404'
+    await clickDemo()
+    await b.waitFor(`!!u.$('.alert[role=alert]')`, 15000)
+    const f1 = await demoState()
+    const retry1 = await b.ev(`!u.$('[data-ui="demo-load"]').disabled`)
+    check(21, 'デモの取得失敗（HTTP 404）: 分かるエラーを表示・音源なしのまま・もう一度押せる', /見つかりませんでした/.test(f1.alert) && !f1.summary && !f1.loading && retry1, f1.alert)
+    await b.ev(`u.$('.alert__close').click()`)
+
+    // 既存の音源があるときに失敗しても、その音源を保持する（WAV でない応答 = 未配置で index.html が返る場合）
+    await b.setFile(FILES.music)
+    await b.waitFor(`/ui-test-music\\.wav/.test(u.$('[data-ui="file-summary"]')?.textContent ?? '')`, 30000)
+    mode = 'html'
+    await clickDemo()
+    await b.waitFor(`!!u.$('.alert[role=alert]')`, 15000)
+    const f2 = await demoState()
+    check(21, 'デモの取得失敗（WAV でない応答）: 直前の音源を保持して理由を表示', /見つかりませんでした/.test(f2.alert) && /保持/.test(f2.alertAll) && /ui-test-music\.wav/.test(f2.summary) && !f2.badge && f2.sections.length === 0, f2.alert)
+    await b.ev(`u.$('.alert__close').click()`)
+
+    // ---- 22. 読み込みの競合: デモの取得中に通常のファイルを選ぶと、ファイルが優先され、デモの結果は反映しない ----
+    mode = 'hold'
+    held = null
+    await clickDemo()
+    const pausedOk = await b.waitFor(`true`, 100) && (await (async () => { for (let i = 0; i < 100 && !held; i++) await sleep(50); return !!held })())
+    const loadingShown = (await demoState()).loading
+    await b.setFile(FILES.music2)
+    await b.waitFor(`/ui-test-music-2\\.wav/.test(u.$('[data-ui="file-summary"]')?.textContent ?? '')`, 30000)
+    mode = 'off'
+    if (held) await b.send('Fetch.continueRequest', { requestId: held })
+    await sleep(3000)
+    const r1 = await demoState()
+    check(22, '読み込みの競合: デモの取得中にファイルを選ぶと、そのファイルだけが反映される（後からデモで上書きしない）', pausedOk && loadingShown && /ui-test-music-2\.wav/.test(r1.summary) && !r1.badge && r1.sections.length === 0 && !r1.loading && !r1.alert, JSON.stringify({ pausedOk, loadingShown, badge: r1.badge, alert: r1.alert }))
+    await b.send('Fetch.disable')
+
+    // ---- 23. デモ音源の読み込み（実際のファイル） ----
+    const c0 = await b.ev(`u.counters()`)
+    await clickDemo()
+    const ok = await b.waitFor(`!!u.$('[data-ui="demo-source"]')`, 60000)
+    const d1 = await demoState()
+    const c1 = await b.ev(`u.counters()`)
+    check(23, 'デモ音源を読み込める（公式デモの表示・WAV・40 秒・48 kHz・ステレオ）', ok && /Spatial Showcase/.test(d1.summary) && /音声（WAV）/.test(d1.summary) && /00:40\.00/.test(d1.summary) && /48(\.0)? ?kHz/.test(d1.summary) && /ステレオ|2/.test(d1.summary), d1.summary.replace(/\n/g, ' / '))
+    check(23, 'デモでも AudioContext は 1 つのまま・元のファイルの Object URL は 1 つ（前のものは解放）', c1.audioCtx === Math.max(1, c0.audioCtx) && c1.live.length === 1, `AudioContext ${c0.audioCtx} → ${c1.audioCtx}、生きている URL ${c1.live.length}`)
+    const orig = await b.ev(`({ text: u.$('[data-ui="demo-original"]')?.textContent ?? '', name: u.$('[data-ui="demo-original"] a')?.getAttribute('download') ?? '' })`)
+    check(23, '元のデモ音源のダウンロードに「公式デモ音源」と明記', /公式デモ音源/.test(orig.text) && orig.name === 'CINEMA_SONIC_X_Spatial_Showcase_40s_24bit.wav', JSON.stringify(orig))
+
+    // ---- 24. 5 つの区間とシーク ----
+    const labels = await b.ev(`u.$$('[data-section] .demo-section__label').map((e) => e.textContent)`)
+    check(24, '区間の表示: Intro / Groove / Main / Space / Outro', labels.join('|') === 'Intro|Groove|Main|Space|Outro', labels.join(' '))
+    const starts = { intro: 0, groove: 4, main: 12, space: 28, outro: 36 }
+    const seekRes = []
+    for (const [id, t] of Object.entries(starts)) {
+      await b.ev(`u.$('[data-section="${id}"]').click()`)
+      await sleep(150)
+      const s = await b.ev(`({ pos: u.position(), cur: u.$('[data-section][aria-current="true"]')?.dataset.section ?? null })`)
+      seekRes.push({ id, ...s, ok: Math.abs(s.pos - t) < 0.011 && s.cur === id })
+    }
+    check(24, '区間を押すとその開始位置へシーク（停止中）・その区間を選択中に表示', seekRes.every((r) => r.ok), seekRes.map((r) => `${r.id}:${r.pos}/${r.cur}`).join(' '))
+
+    // ---- 25. 再生中の区間の表示 ----
+    await b.ev(`u.$('[data-preset="motion-360"]').click()`)
+    await b.waitFor(`!u.byText('.output-stage__note', '測定中')`, 60000)
+    await b.ev(`u.$('[data-section="main"]').click()`)
+    await b.ev(`u.$('.simple-preview [aria-label="再生"]').click()`)
+    await sleep(1200)
+    const a1 = await b.ev(`({ pos: u.position(), cur: u.$('[data-section][aria-current="true"]')?.dataset.section, n: u.$$('[data-section].is-active').length })`)
+    // 再生中に区間を押す: 再生を続けたままその位置へ（27.4 秒付近から Space へ移る）
+    await b.ev(`u.$('[data-section="space"]').click()`)
+    await sleep(800)
+    const a2 = await b.ev(`({ pos: u.position(), cur: u.$('[data-section][aria-current="true"]')?.dataset.section, playing: !!u.$('.simple-preview [aria-label="一時停止"]') })`)
+    await b.ev(`u.$('[data-section="groove"]').click()`)
+    await sleep(500)
+    await b.ev(`u.setRange('#simple-seek', 11.3)`)
+    await sleep(1500)
+    const a3 = await b.ev(`({ pos: u.position(), cur: u.$('[data-section][aria-current="true"]')?.dataset.section })`)
+    check(25, '再生中の区間: Main を再生中は Main だけを選択中', a1.pos > 12.5 && a1.pos < 16 && a1.cur === 'main' && a1.n === 1, JSON.stringify(a1))
+    check(25, '再生中に区間を押すと再生を続けたまま移動', a2.playing && a2.pos >= 28 && a2.pos < 30 && a2.cur === 'space', JSON.stringify(a2))
+    check(25, '再生が区間の境目（12 秒）を越えると表示が Groove → Main に変わる', a3.pos > 12 && a3.pos < 14 && a3.cur === 'main', JSON.stringify(a3))
+
+    // ---- 26. 4 つのプリセット・ORIGINAL / PROCESSED（再生中） ----
+    const picked = []
+    for (const id of ['cinema-3d', 'live-arena', 'motion-360', 'immersive-x']) {
+      await b.ev(`u.$('[data-preset="${id}"]').click()`)
+      picked.push(`${id}:${await b.waitFor(`u.$('[data-preset="${id}"]').getAttribute('aria-checked') === 'true'`, 5000)}`)
+      await sleep(400)
+    }
+    const measured = await b.waitFor(`!u.byText('.output-stage__note', '測定中')`, 60000)
+    const anErr = await b.ev(`u.$$('.badge').map((e) => e.textContent).filter((t) => /エラー|ERROR/.test(t))`)
+    check(26, 'デモで 4 つのプリセットを選べる（測定が終わる・エラーなし）', picked.every((p) => p.endsWith('true')) && measured && anErr.length === 0, picked.join(' '))
+    const p0 = await b.ev(`u.position()`)
+    await b.ev(`u.byText('.simple-preview .ab-switch__item', 'ORIGINAL').click()`)
+    await sleep(600)
+    const ab1 = await b.ev(`({ pos: u.position(), orig: u.byText('.simple-preview .ab-switch__item', 'ORIGINAL').getAttribute('aria-checked') })`)
+    await b.ev(`u.byText('.simple-preview .ab-switch__item', 'PROCESSED').click()`)
+    await sleep(600)
+    const ab2 = await b.ev(`({ pos: u.position(), proc: u.byText('.simple-preview .ab-switch__item', 'PROCESSED').getAttribute('aria-checked') })`)
+    check(26, 'デモで ORIGINAL / PROCESSED を再生中に切替（位置が進み続ける）', ab1.orig === 'true' && ab2.proc === 'true' && ab1.pos > p0 && ab2.pos > ab1.pos, `${p0} → ${ab1.pos} → ${ab2.pos}`)
+    await b.ev(`u.$('.simple-preview [aria-label="一時停止"]').click()`)
+    await sleep(300)
+    await b.ev(`u.$('[data-section="space"]').click()`)
+    await sleep(200)
+    await b.shot('20-demo-simple')
+
+    // ---- 27. SIMPLE ↔ STUDIO の切替で状態を保つ ----
+    // 音源の測定が終わってから数える（音声のセッションの項目 3 と同じ。切替と関係のない処理の終わりを数えない）
+    await b.waitFor(`!u.byText('.output-stage__note', '測定中')`, 60000)
+    const cIdle0 = await b.ev(`u.counters()`)
+    await sleep(3000)
+    const cA = await b.ev(`u.counters()`)
+    info('切替の前の 3 秒（操作なし）の OfflineAudioContext の作成', `${cIdle0.offlineCtx} → ${cA.offlineCtx}`)
+    const sPos = await b.ev(`u.position()`)
+    await b.ev(`u.$('[data-mode="studio"]').click()`)
+    await b.waitFor(`u.view() === 'studio'`, 5000)
+    const st = await b.ev(`({ pos: u.position(), panel: !!u.$('.panel--demo [data-section]'), cur: u.$('.panel--demo [data-section][aria-current="true"]')?.dataset.section ?? null, source: u.byText('.panel--info dd', '公式デモ音源')?.textContent ?? '', file: u.$('.panel--info .file-name')?.textContent ?? '', preset: u.$('#studio-preset .panel__aside')?.textContent ?? '' })`)
+    check(27, 'STUDIO: デモ音源・再生位置・プリセット・区間の表示を保つ', st.pos === sPos && st.panel && st.cur === 'space' && /公式デモ音源/.test(st.source) && /Spatial_Showcase/.test(st.file) && /IMMERSIVE X/.test(st.preset), JSON.stringify(st))
+    await sleep(1000)
+    const cS1 = await b.ev(`u.counters()`)
+    await b.ev(`u.$('.panel--demo [data-section="outro"]').click()`)
+    await sleep(1000)
+    const cS2 = await b.ev(`u.counters()`)
+    // STUDIO を初めて表示すると、EQ のグラフ（EqCurve → eqResponse.ts）が周波数特性の計算用の OfflineAudioContext（1 フレーム・ワークレットなし）を 1 つだけ作る（既存の動作。解析ではない）。
+    // 音声のセッションの項目 3 と同じく、STUDIO を一度表示した後から数える
+    info('OfflineAudioContext: 切替前 → STUDIO を初めて表示（EQ のグラフ用に 1 つ）→ STUDIO の区間でシーク', `${cA.offlineCtx} → ${cS1.offlineCtx} → ${cS2.offlineCtx}`)
+    const stPos = await b.ev(`u.position()`)
+    await b.shot('21-demo-studio')
+    await b.ev(`u.$('[data-mode="simple"]').click()`)
+    await b.waitFor(`u.view() === 'simple'`, 5000)
+    for (const m of ['studio', 'simple', 'studio', 'simple']) {
+      await b.ev(`u.$('[data-mode="${m}"]').click()`)
+      await b.waitFor(`u.view() === '${m}'`, 5000)
+    }
+    await sleep(1000)
+    const back = await b.ev(`({ pos: u.position(), cur: u.$('[data-section][aria-current="true"]')?.dataset.section, preset: u.$('[data-preset="immersive-x"]').getAttribute('aria-checked'), badge: !!u.$('[data-ui="demo-source"]') })`)
+    const cB = await b.ev(`u.counters()`)
+    check(27, 'STUDIO の区間でシーク → SIMPLE に戻っても位置・区間・プリセットを保つ', Math.abs(stPos - 36) < 0.011 && back.pos === stPos && back.cur === 'outro' && back.preset === 'true' && back.badge, JSON.stringify({ stPos, ...back }))
+    check(27, 'モードの切替（STUDIO を一度表示した後に 3 往復）・区間のシークで再解析・AudioContext・Object URL の作成が起きない', cB.offlineCtx === cS1.offlineCtx && cB.audioCtx === cA.audioCtx && cB.created === cA.created, `OfflineAudioContext ${cS1.offlineCtx} → ${cB.offlineCtx}、AudioContext ${cA.audioCtx} → ${cB.audioCtx}、Object URL の作成 ${cA.created} → ${cB.created}`)
+
+    // ---- 28. デモの WAV の書き出し（既存の書き出し・余韻で 40 秒より長くてよい） ----
+    await startExport(b)
+    const ex = await waitExport(b, 300000)
+    const wavUrl = ex.done ? await b.ev(`u.$('[data-ui="download"]').getAttribute('href')`) : null
+    const wav = wavUrl ? await b.ev(`u.wavInfo(${JSON.stringify(wavUrl)})`) : null
+    const name = ex.done ? await b.ev(`u.$('[data-ui="download"]').getAttribute('download')`) : ''
+    check(28, 'デモの WAV の書き出し: COMPLETE・48 kHz・ステレオ・40 秒 + 余韻', ex.done && !!wav && wav.riff === 'RIFF' && wav.sampleRate === 48000 && wav.channels === 2 && wav.seconds >= 40 && wav.seconds < 60, `${JSON.stringify(wav)}・${ex.ms} ms${ex.err ? `・${ex.err}` : ''}`)
+    check(28, '書き出しのファイル名（デモ音源の名前・設定名・ビット深度）', /^CINEMA_SONIC_X_Spatial_Showcase_40s_24bit_IMMERSIVE_X_16bit\.wav$/.test(name), name)
+    if (ex.done) {
+      const size = await b.ev(`(async () => (await (await fetch(u.$('[data-ui="download"]').href)).blob()).size)()`)
+      await b.ev(`u.$('[data-ui="download"]').click()`)
+      let dl = false
+      for (let i = 0; i < 80 && !dl; i++) {
+        await sleep(250)
+        dl = readdirSync(b.download).some((n) => n === name && statSync(join(b.download, n)).size === size)
+      }
+      check(28, 'デモの完成ファイルをダウンロードできる（同じサイズ）', dl, `${size} bytes`)
+    }
+    await workletCheck(b)
+
+    // ---- 29. 通常のファイルに差し替えると、区間・デモの表示は出さない ----
+    await b.setFile(FILES.music)
+    await b.waitFor(`/ui-test-music\\.wav/.test(u.$('[data-ui="file-summary"]')?.textContent ?? '')`, 30000)
+    const up = await demoState()
+    const upStudio = await b.ev(`(async () => { u.$('[data-mode="studio"]').click(); await new Promise((r) => setTimeout(r, 300)); const r = { panel: !!u.$('.panel--demo'), source: u.byText('.panel--info dd', 'アップロードしたファイル')?.textContent ?? '' }; u.$('[data-mode="simple"]').click(); await new Promise((r) => setTimeout(r, 300)); return r })()`)
+    check(29, '通常のファイル: 区間・公式デモの表示なし（SIMPLE / STUDIO）・書き出しの結果は消える', up.sections.length === 0 && !up.badge && !upStudio.panel && /アップロード/.test(upStudio.source) && !(await b.ev(`!!u.$('[data-ui="result"]')`)), JSON.stringify(upStudio))
+
+    // ---- 30. スマートフォンの幅: デモを読み込んだ画面がはみ出さない ----
+    await clickDemo()
+    await b.waitFor(`!!u.$('[data-ui="demo-source"]')`, 60000)
+    for (const [w, h, label] of [
+      [390, 844, 'phone'],
+      [768, 1024, 'tablet-portrait'],
+    ]) {
+      await b.viewport(w, h, w < 800)
+      await sleep(400)
+      const l = await layoutCheck(b, label)
+      const sec = await b.ev(`(() => { const r = u.$$('[data-section]').map((e) => e.getBoundingClientRect()); return { n: r.length, minW: Math.min(...r.map((x) => x.width)), inside: r.every((x) => x.right <= window.innerWidth && x.left >= 0) } })()`)
+      check(30, `デモ（${label} ${w}px）: 横にはみ出さない・区間 5 つが画面内`, l.over <= 0 && l.wide.length === 0 && sec.n === 5 && sec.inside && sec.minW >= 80, `はみ出し ${l.over}px、区間の最小幅 ${sec.minW.toFixed(0)}px${l.wide.length ? `、${l.wide.join(', ')}` : ''}`)
+      await b.shot(`22-demo-${label}`)
+    }
+    await b.viewport(1440, 900)
+    const errs = b.errors.filter((e) => !/favicon/.test(e))
+    check(18, 'ページのエラー（例外・console.error）なし', errs.length === 0, errs.slice(0, 3).join(' | '))
+  } finally {
+    await b.close()
+  }
+}
+
 console.log(`ブラウザ: ${browser}${usePreview ? '（本番ビルド: vite preview）' : ''}\n`)
 let aborted = null
 for (const [name, fn] of [
   ['audio', audioSession],
   ['video', videoSession],
+  ['demo', demoSession],
 ]) {
   if (onlySession && onlySession !== name) continue
   console.log(`━━ セッション: ${name} ━━`)

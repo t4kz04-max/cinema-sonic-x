@@ -19,6 +19,11 @@ function buildRows(audio: LoadedAudio): Row[] {
   const resampled = header.sampleRate !== null && header.sampleRate !== buffer.sampleRate
   const v = audio.video?.info
   const rows: Row[] = [
+    {
+      label: '出どころ',
+      value: audio.source.kind === 'demo' ? '公式デモ音源' : 'アップロードしたファイル',
+      note: audio.source.kind === 'demo' ? 'このサイトのサンプル音源（CINEMA SONIC X のオリジナル）' : undefined,
+    },
     { label: '種類', value: v ? `動画（${v.container.toUpperCase()}）` : '音声' },
     ...(v
       ? [

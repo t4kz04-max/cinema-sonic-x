@@ -15,7 +15,11 @@ import { platformLimits } from '../utils/platform'
 import type { VideoExportResult, VideoJob, VideoJobProgress } from '../video/videoExport'
 import { encodeWav } from '../audio/export/wavEncoder'
 import { estimateVideoExportBytes, EXT_OF, VideoCancelledError, VideoTimeoutError, type VideoTailMode } from '../video/videoSpec'
-import type { DspStatus, LoadError, LoadedAudio, PlaybackStatus } from '../types/audio'
+import type { AudioSource, DspStatus, LoadError, LoadedAudio, PlaybackStatus } from '../types/audio'
+import { DEMO_DURATION_TOLERANCE, getDemo, type DemoId } from '../demo/demoSpec'
+import { DemoFetchError, fetchDemoFile } from '../demo/fetchDemo'
+
+const UPLOAD_SOURCE: AudioSource = { kind: 'upload' }
 import { createPlaybackClock, NO_METERS } from './playbackClock'
 
 /** 初期音量（%）。gain = (40/100)^2 = 0.16 ≒ -15.9 dB と控えめにする */
@@ -101,6 +105,8 @@ export function useAudioPlayer() {
   const engineRef = useRef<AudioEngine | null>(null)
   const volumeRef = useRef(DEFAULT_VOLUME_PERCENT)
   const loadTokenRef = useRef(0)
+  /** 取得中のデモ音源（別の読み込みを始めたら中止する） */
+  const demoAbortRef = useRef<AbortController | null>(null)
   const bassParamsRef = useRef<BassParams>(DEFAULT_BASS_PARAMS)
   const spatialParamsRef = useRef<SpatialParams>(DEFAULT_SPATIAL_PARAMS)
   const loopRef = useRef<LoopState>(INITIAL_LOOP)
@@ -197,6 +203,8 @@ export function useAudioPlayer() {
       if (originalUrlRef.current) URL.revokeObjectURL(originalUrlRef.current)
       videoJobRef.current?.cancel()
       if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current)
+      demoAbortRef.current?.abort()
+      demoAbortRef.current = null
       exportUrlRef.current = null
       originalUrlRef.current = null
       videoUrlRef.current = null
@@ -204,34 +212,101 @@ export function useAudioPlayer() {
     [],
   )
 
-  const loadFile = useCallback(
-    async (file: File) => {
-      const token = ++loadTokenRef.current
-      setLoadingName(file.name)
-      setError(null)
+  /**
+   * 読み込みを始める（番号を進め、取得中のデモ音源を中止する）。
+   * 後から始めた読み込みだけが結果を反映する（古い結果・取得の失敗は捨てる）
+   */
+  const beginLoad = useCallback((name: string) => {
+    const token = ++loadTokenRef.current
+    demoAbortRef.current?.abort()
+    demoAbortRef.current = null
+    setLoadingName(name)
+    setError(null)
+    return token
+  }, [])
+
+  /** デコードして反映する（アップロード・デモ音源で共通。成功したときだけ音源と出どころを更新する） */
+  const decodeAndApply = useCallback(
+    async (file: File, token: number, source: AudioSource) => {
       const engine = getEngine()
-      try {
-        const result = await loadAudioFile(file, (data) => engine.decode(data))
-        // 読み込み中に別ファイルが選ばれた場合は古い結果を捨てる
-        if (token !== loadTokenRef.current) return
-        if (!result.ok) {
-          // 失敗時は直前の音源をそのまま保持する
-          setError(result.error)
+      const result = await loadAudioFile(file, (data) => engine.decode(data))
+      // 読み込み中に別ファイルが選ばれた場合は古い結果を捨てる
+      if (token !== loadTokenRef.current) return
+      if (!result.ok) {
+        // 失敗時は直前の音源をそのまま保持する
+        setError(result.error)
+        return
+      }
+      if (source.kind === 'demo') {
+        // 区間はこの長さを前提にしているため、違う音源が置かれていたら反映しない
+        const demo = getDemo(source.demoId)
+        if (result.audio.video || Math.abs(result.audio.buffer.duration - demo.durationSeconds) > DEMO_DURATION_TOLERANCE) {
+          setError({ kind: 'demo', message: 'サンプル音源の内容が想定と異なるため読み込みませんでした。', detail: `期待する長さ ${demo.durationSeconds} 秒・読み込んだ長さ ${result.audio.buffer.duration.toFixed(2)} 秒。` })
           return
         }
-        resetExport()
-        if (originalUrlRef.current) URL.revokeObjectURL(originalUrlRef.current)
-        originalUrlRef.current = URL.createObjectURL(result.audio.file)
-        setOriginalUrl(originalUrlRef.current)
-        engine.setBuffer(result.audio.buffer)
-        setMusicRegion(engine.getMusicRegion())
-        setAudio(result.audio)
-        clock.set({ position: 0 })
+      }
+      resetExport()
+      if (originalUrlRef.current) URL.revokeObjectURL(originalUrlRef.current)
+      originalUrlRef.current = URL.createObjectURL(result.audio.file)
+      setOriginalUrl(originalUrlRef.current)
+      engine.setBuffer(result.audio.buffer)
+      setMusicRegion(engine.getMusicRegion())
+      setAudio({ ...result.audio, source })
+      clock.set({ position: 0 })
+    },
+    [getEngine, resetExport, clock],
+  )
+
+  const loadFile = useCallback(
+    async (file: File) => {
+      const token = beginLoad(file.name)
+      try {
+        await decodeAndApply(file, token, UPLOAD_SOURCE)
       } finally {
         if (token === loadTokenRef.current) setLoadingName(null)
       }
     },
-    [getEngine, resetExport, clock],
+    [beginLoad, decodeAndApply],
+  )
+
+  /**
+   * 公式デモ音源を読み込む（ボタンを押したときだけ同じサイトから取得する）。取得した後は通常のファイルと同じ経路。
+   * 取得中に別のファイル・デモを読み込み始めたら、この取得は中止して結果を捨てる
+   */
+  const loadDemo = useCallback(
+    async (id: DemoId) => {
+      const demo = getDemo(id)
+      const token = beginLoad(`${demo.title}（サンプル音源を取得中）`)
+      const ac = new AbortController()
+      demoAbortRef.current = ac
+      try {
+        let file: File
+        try {
+          file = await fetchDemoFile(demo, ac.signal)
+        } catch (e) {
+          if (token !== loadTokenRef.current) return
+          const reason = e instanceof DemoFetchError ? e.reason : 'network'
+          setError({
+            kind: 'demo',
+            message:
+              reason === 'not-wav' || (e instanceof DemoFetchError && e.status === 404)
+                ? 'サンプル音源が見つかりませんでした（サイトに配置されていない可能性があります）。ご自身のファイルは通常どおり読み込めます。'
+                : reason === 'timeout'
+                  ? 'サンプル音源の取得に時間がかかりすぎたため中止しました。通信状態を確認して、もう一度「サンプル音源で試す」を押してください。'
+                  : 'サンプル音源を取得できませんでした。通信状態を確認して、もう一度「サンプル音源で試す」を押してください。',
+            detail: e instanceof Error ? e.message : String(e),
+          })
+          return
+        }
+        if (token !== loadTokenRef.current) return
+        setLoadingName(`${demo.title}（デコード中）`)
+        await decodeAndApply(file, token, { kind: 'demo', demoId: id })
+      } finally {
+        if (demoAbortRef.current === ac) demoAbortRef.current = null
+        if (token === loadTokenRef.current) setLoadingName(null)
+      }
+    },
+    [beginLoad, decodeAndApply],
   )
 
   const play = useCallback(async () => {
@@ -566,6 +641,7 @@ export function useAudioPlayer() {
       loadingName,
       error,
       loadFile,
+      loadDemo,
       play,
       pause,
       stop,
@@ -616,6 +692,7 @@ export function useAudioPlayer() {
       loadingName,
       error,
       loadFile,
+      loadDemo,
       play,
       pause,
       stop,

@@ -4,11 +4,49 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="ブラウザ完結型の重低音強化Webアプリ" />
-    <title>CINEMA SONIC X</title>
+    <title>CINEMA SONIC X｜ブラウザで使える立体音響・重低音の加工ツール</title>
+    <meta
+      name="description"
+      content="音声・動画ファイルをブラウザの中だけで立体音響（4 種類のプリセット）と重低音に加工し、元の音と聴き比べて WAV・動画で書き出せる無料の Web アプリ。ファイルはサーバーへ送信しません。Spatial audio and bass processing that runs entirely in your browser."
+    />
+    <link rel="canonical" href="https://cinema-sonic-x.vercel.app/" />
+    <meta name="robots" content="index, follow" />
+    <meta name="theme-color" content="#060607" />
+
+    <!-- OGP（共有したときの表示。画像は未設定） -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="CINEMA SONIC X" />
+    <meta property="og:title" content="CINEMA SONIC X｜ブラウザで使える立体音響・重低音の加工ツール" />
+    <meta
+      property="og:description"
+      content="音声・動画をブラウザの中だけで立体音響と重低音に加工し、聴き比べて WAV・動画で書き出せる Web アプリ。サンプル音源ですぐに試せます。"
+    />
+    <meta property="og:url" content="https://cinema-sonic-x.vercel.app/" />
+    <meta property="og:locale" content="ja_JP" />
+    <meta property="og:locale:alternate" content="en_US" />
+    <meta name="twitter:card" content="summary" />
+
+    <!-- 構造化データ（実際にある機能だけを書く。評価・価格以外の宣伝文句は入れない） -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "CINEMA SONIC X",
+        "url": "https://cinema-sonic-x.vercel.app/",
+        "applicationCategory": "MultimediaApplication",
+        "operatingSystem": "Web browser (desktop Chrome / Edge recommended)",
+        "inLanguage": ["ja", "en"],
+        "isAccessibleForFree": true,
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "JPY" },
+        "description": "Browser-based spatial audio and bass processing for audio and video files. Files are processed locally in the browser and are not uploaded to a server."
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
+    <noscript>
+      <p>CINEMA SONIC X はブラウザで動く音声加工アプリです。利用するには JavaScript を有効にしてください。 / CINEMA SONIC X is a browser-based audio app. Please enable JavaScript.</p>
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

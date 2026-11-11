@@ -54,6 +54,7 @@ async function loadVideoFile(file: File): Promise<LoadResult> {
     return {
       ok: true,
       audio: {
+        source: { kind: 'upload' },
         fileName: file.name,
         fileSizeBytes: file.size,
         format: info.container,
@@ -147,6 +148,7 @@ export async function loadAudioFile(
   return {
     ok: true,
     audio: {
+      source: { kind: 'upload' },
       fileName: file.name,
       fileSizeBytes: file.size,
       format: inspected.format,

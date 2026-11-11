@@ -38,6 +38,14 @@ export function createPlaybackClock(): PlaybackClock {
   }
 }
 
+/**
+ * 再生位置から求めた値だけを購読する（select はプリミティブを返す）。値が変わったときだけ再描画される
+ * （例: デモ音源の再生中の区間。毎フレームではなく区間が変わったときだけ）
+ */
+export function usePlaybackSelector<T extends string | number | boolean | null>(clock: PlaybackClock, select: (v: PlaybackClockValue) => T): T {
+  return useSyncExternalStore(clock.subscribe, () => select(clock.get()))
+}
+
 /** 再生位置・メーターを購読する（この部品だけが毎フレーム再描画される） */
 export function usePlaybackClock(clock: PlaybackClock): PlaybackClockValue {
   return useSyncExternalStore(clock.subscribe, clock.get)

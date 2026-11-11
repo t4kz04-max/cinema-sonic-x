@@ -1,6 +1,7 @@
 import type { Spectrum } from '../audio/spectrum'
 import type { StereoMetrics } from '../audio/stereoMetrics'
 import type { VideoInfo } from '../video/videoSpec'
+import type { DemoId } from '../demo/demoSpec'
 
 /**
  * wav / mp3: 対応形式。flac / ogg / m4a / webm: ブラウザのデコーダーが対応していれば読み込める形式。
@@ -19,7 +20,14 @@ export interface SourceHeaderInfo {
   codec: string | null
 }
 
+/**
+ * 音源の出どころ。upload: 利用者が選んだファイル / demo: サイトに置いた公式デモ音源。
+ * ファイル名ではなくこの値で区別する（デモの区間表示などは demo のときだけ出す）
+ */
+export type AudioSource = { kind: 'upload' } | { kind: 'demo'; demoId: DemoId }
+
 export interface LoadedAudio {
+  source: AudioSource
   fileName: string
   fileSizeBytes: number
   format: SourceFormat
@@ -103,6 +111,8 @@ export type LoadErrorKind =
   | 'memory'
   | 'context'
   | 'no-audio'
+  /** 公式デモ音源の取得の失敗（通信・未配置・時間切れ・内容の不一致） */
+  | 'demo'
 
 export interface LoadError {
   kind: LoadErrorKind
