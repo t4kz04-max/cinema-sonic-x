@@ -4,6 +4,7 @@
 //         CSX_BROWSER=<実行ファイル> npm run test:ui
 //         node scripts/run-ui-test.mjs --session=audio|video   （一部だけ）
 //         node scripts/run-ui-test.mjs --screens=<フォルダー>   （確認用の画面写真を保存）
+//         vercel env run -- node scripts/run-ui-test.mjs --session=demo --url=<Preview の URL>   （公開した Preview。保護は VERCEL_OIDC_TOKEN のヘッダーで通す）
 //         node scripts/run-ui-test.mjs --preview   （本番ビルド（dist、先に npm run build）を vite preview で開く。Phase 10: 公開前の確認）
 // 依存追加なし: Vite の開発サーバー + Chrome DevTools Protocol（Node 22+ の組み込み WebSocket）
 // 試験用の音声（WAV）は Node で合成し、試験用の動画は src/dev/videoFixtures.ts（WebCodecs）でブラウザ内で作る。
@@ -201,7 +202,11 @@ const devServer = await createServer({ logLevel: 'error', server: { port: 5299, 
 await devServer.listen()
 const fixtureUrl = devServer.resolvedUrls.local[0]
 const server = usePreview ? await preview({ logLevel: 'error', preview: { port: 4299, strictPort: false } }) : devServer
-const baseUrl = server.resolvedUrls.local[0]
+// --url=<https://…>: 公開したデプロイ（Vercel の Preview など）を開く（--session=demo を想定。動画の試験用ファイルの作成には開発サーバーを使う）。
+// 保護された Preview は、環境変数 VERCEL_OIDC_TOKEN（`vercel env run -- node …` が渡す短期のトークン）を、その URL のオリジンへの要求だけにヘッダーで付ける。値は表示しない
+const remoteUrl = process.argv.find((a) => a.startsWith('--url='))?.slice(6) ?? null
+const baseUrl = remoteUrl ? `${remoteUrl.replace(/\/$/, '')}/` : server.resolvedUrls.local[0]
+const trustedToken = remoteUrl ? (process.env.VERCEL_OIDC_TOKEN ?? null) : null
 
 const results = []
 let currentSession = ''
@@ -309,6 +314,37 @@ async function launch() {
   await send('DOM.enable')
   await send('Performance.enable')
   await send('Page.addScriptToEvaluateOnNewDocument', { source: INSTRUMENT })
+  // 要求の差し替え（CDP の Fetch）。保護された Preview の認証ヘッダーと、試験のための応答の差し替え（デモの取得の失敗・保留）を 1 つにまとめる。
+  // 認証ヘッダーは Network.setExtraHTTPHeaders では AudioWorklet の addModule の要求に付かない（SSO へ転送されて読み込みに失敗する）ため、
+  // ネットワークの層（Fetch.continueRequest）で、開いたデプロイのオリジンへの要求だけに付ける。ほかのオリジンには付けない
+  let interceptHook = null
+  const authOrigin = trustedToken ? new URL(baseUrl).origin : null
+  const continuePaused = (p) => {
+    const add = authOrigin && new URL(p.request.url).origin === authOrigin
+    const headers = add ? [...Object.entries(p.request.headers).map(([name, value]) => ({ name, value })), { name: 'x-vercel-trusted-oidc-idp-token', value: trustedToken }] : undefined
+    return send('Fetch.continueRequest', { requestId: p.requestId, ...(headers ? { headers } : {}) })
+  }
+  handlers.set('Fetch.requestPaused', (p) => {
+    if (interceptHook?.(p)) return
+    void continuePaused(p)
+  })
+  /** hook(p) が true を返した要求は hook が応答する（fulfill / 保留）。null で差し替えをやめる（認証ヘッダーは付け続ける） */
+  const intercept = async (hook, urlPattern) => {
+    interceptHook = hook
+    const patterns = [...(authOrigin ? [{ urlPattern: `${authOrigin}/*` }] : []), ...(hook && urlPattern ? [{ urlPattern }] : [])]
+    await send(patterns.length ? 'Fetch.enable' : 'Fetch.disable', patterns.length ? { patterns } : {})
+  }
+  if (authOrigin) await intercept(null)
+  // 公開したデプロイを開くとき: 同じオリジン以外への要求を記録する（音声・ファイル名を外へ送っていないことの確認。トークンを付けた要求が外へ出ていないことの確認）
+  const foreign = []
+  if (remoteUrl) {
+    await send('Network.enable')
+    const origin = new URL(baseUrl).origin
+    handlers.set('Network.requestWillBeSent', (p) => {
+      const u = p.request.url
+      if (/^https?:/.test(u) && new URL(u).origin !== origin) foreign.push(u.slice(0, 120))
+    })
+  }
   await send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: download })
   await viewport(1440, 900)
   const close = async () => {
@@ -335,7 +371,7 @@ async function launch() {
     }
   }
   const metrics = async () => Object.fromEntries((await send('Performance.getMetrics')).result.metrics.map((m) => [m.name, m.value]))
-  return { send, on, ev, waitFor, setFile, shot, viewport, navigate, close, errors, download, browserMemoryMb, metrics }
+  return { send, on, intercept, continuePaused, ev, waitFor, setFile, shot, viewport, navigate, close, errors, foreign, download, browserMemoryMb, metrics }
 }
 
 /** 書き出しを始める（段階の表示の変化を記録する監視を付けてから押す） */
@@ -862,13 +898,15 @@ async function demoSession() {
     // ---- 21. 取得の失敗（404・WAV でない応答）→ エラーを表示し、もう一度押せる ----
     let mode = 'off'
     let held = null
-    b.on('Fetch.requestPaused', (p) => {
+    const demoHook = (p) => {
+      if (!p.request.url.includes(DEMO_PATH)) return false
       if (mode === '404') void b.send('Fetch.fulfillRequest', { requestId: p.requestId, responseCode: 404, responseHeaders: [{ name: 'Content-Type', value: 'text/plain' }], body: Buffer.from('not found').toString('base64') })
       else if (mode === 'html') void b.send('Fetch.fulfillRequest', { requestId: p.requestId, responseCode: 200, responseHeaders: [{ name: 'Content-Type', value: 'text/html' }], body: Buffer.from('<!doctype html><title>x</title>').toString('base64') })
-      else if (mode === 'hold') held = p.requestId
-      else void b.send('Fetch.continueRequest', { requestId: p.requestId })
-    })
-    await b.send('Fetch.enable', { patterns: [{ urlPattern: `*${DEMO_PATH}*` }] })
+      else if (mode === 'hold') held = p
+      else return false
+      return true
+    }
+    await b.intercept(demoHook, `*${DEMO_PATH}*`)
     mode = '404'
     await clickDemo()
     await b.waitFor(`!!u.$('.alert[role=alert]')`, 15000)
@@ -896,11 +934,11 @@ async function demoSession() {
     await b.setFile(FILES.music2)
     await b.waitFor(`/ui-test-music-2\\.wav/.test(u.$('[data-ui="file-summary"]')?.textContent ?? '')`, 30000)
     mode = 'off'
-    if (held) await b.send('Fetch.continueRequest', { requestId: held })
+    if (held) await b.continuePaused(held)
     await sleep(3000)
     const r1 = await demoState()
     check(22, '読み込みの競合: デモの取得中にファイルを選ぶと、そのファイルだけが反映される（後からデモで上書きしない）', pausedOk && loadingShown && /ui-test-music-2\.wav/.test(r1.summary) && !r1.badge && r1.sections.length === 0 && !r1.loading && !r1.alert, JSON.stringify({ pausedOk, loadingShown, badge: r1.badge, alert: r1.alert }))
-    await b.send('Fetch.disable')
+    await b.intercept(null)
 
     // ---- 23. デモ音源の読み込み（実際のファイル） ----
     const c0 = await b.ev(`u.counters()`)
@@ -1047,13 +1085,14 @@ async function demoSession() {
     }
     await b.viewport(1440, 900)
     const errs = b.errors.filter((e) => !/favicon/.test(e))
+    if (remoteUrl) check(31, `公開したデプロイ: 同じオリジン（${new URL(baseUrl).origin}）以外への通信なし`, b.foreign.length === 0, b.foreign.slice(0, 3).join(' | '))
     check(18, 'ページのエラー（例外・console.error）なし', errs.length === 0, errs.slice(0, 3).join(' | '))
   } finally {
     await b.close()
   }
 }
 
-console.log(`ブラウザ: ${browser}${usePreview ? '（本番ビルド: vite preview）' : ''}\n`)
+console.log(`ブラウザ: ${browser}${remoteUrl ? `（公開したデプロイ: ${baseUrl}${trustedToken ? '・Vercel の認証ヘッダーあり' : ''}）` : usePreview ? '（本番ビルド: vite preview）' : ''}\n`)
 let aborted = null
 for (const [name, fn] of [
   ['audio', audioSession],
